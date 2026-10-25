@@ -60,8 +60,9 @@ internal object PlayerDiagLog {
     context: Context,
     on: Boolean,
   ) {
-    enabled = on
-    target = if (on) File(dirOf(context), FILE_NAME) else null
+    // 【临时诊断构建】强制开启，便于定位网盘直连问题；定位完改回 on
+    enabled = true
+    target = File(dirOf(context), FILE_NAME)
   }
 
   /** mpv 的 `log-file` 目标路径；未启用详细日志时返回 null（= 不设这个选项）。 */
