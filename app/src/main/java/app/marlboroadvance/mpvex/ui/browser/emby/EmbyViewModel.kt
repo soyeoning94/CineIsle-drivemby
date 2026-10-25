@@ -1604,7 +1604,10 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
       extra.entries.firstOrNull { it.key.equals("User-Agent", true) }?.value
         ?: EmbyClient.STREAM_USER_AGENT
     val pairs = arrayListOf("User-Agent", ua)
-    if (extra.keys.none { it.equals("Referer", true) }) {
+    // 服务端明确给了请求头（网盘网关 Drivemby 这类）就**只用它给的**：
+    // 百度直链带 Referer 会直接 403（error_code 31326 user is not authorized），
+    // 实测加 `Referer: https://drivemby.com` 必挂，所以这里绝不自己补 Referer。
+    if (extra.isEmpty() && extra.keys.none { it.equals("Referer", true) }) {
       pairs += "Referer"
       pairs += origin
     }
