@@ -1535,13 +1535,28 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
     // 必须用 MediaSources[i].Path/DirectStreamUrl；普通 Emby 返回 null，走原路径。
     val directSource =
       if (overrideUrl == null) {
-        runCatching { EmbyClient.playbackSourceFor(server, itemId, mediaSourceId) }.getOrNull()
+        runCatching { EmbyClient.playbackSourceFor(server, itemId, mediaSourceId) }
+          .onFailure {
+            app.marlboroadvance.mpvex.ui.player.PlayerDiagLog.log(
+              "emby-play",
+              "playbackSourceFor 失败: " + it.javaClass.simpleName + ": " + (it.message ?: ""),
+            )
+          }
+          .getOrNull()
       } else {
         null
       }
     val url = overrideUrl
       ?: directSource?.url
       ?: repository.videoStreamUrl(server, itemId, static = true, mediaSourceId = mediaSourceId)
+    // 【诊断】记录真正交给播放器的地址与请求头 —— 排查网盘直连失败时唯一可靠的一手数据
+    app.marlboroadvance.mpvex.ui.player.PlayerDiagLog.log(
+      "emby-play",
+      "item=" + itemId +
+        " direct=" + (directSource != null) +
+        " url=" + url.take(200) +
+        " headers=" + (directSource?.headers ?: emptyMap<String, String>()).toString(),
+    )
     val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).apply {
       setClass(getApplication(), PlayerActivity::class.java)
       putExtra("internal_launch", true)
