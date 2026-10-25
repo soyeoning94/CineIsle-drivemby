@@ -1,0 +1,509 @@
+package app.marlboroadvance.mpvex.ui.player
+
+import android.content.Context
+import android.os.Environment
+import android.util.AttributeSet
+import android.util.Log
+
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
+import app.marlboroadvance.mpvex.preferences.AdvancedPreferences
+import app.marlboroadvance.mpvex.preferences.AudioPreferences
+import app.marlboroadvance.mpvex.preferences.DecoderPreferences
+import app.marlboroadvance.mpvex.preferences.PlayerPreferences
+import app.marlboroadvance.mpvex.preferences.SubtitlesPreferences
+import app.marlboroadvance.mpvex.domain.anime4k.Anime4KManager
+import app.marlboroadvance.mpvex.ui.player.PlayerActivity.Companion.TAG
+import app.marlboroadvance.mpvex.ui.player.controls.components.panels.toColorHexString
+import `is`.xyz.mpv.BaseMPVView
+import `is`.xyz.mpv.keyMapping
+import `is`.xyz.mpv.MPVLib
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.inject
+import kotlin.reflect.KProperty
+
+/**
+ * 允许交给 Android MediaCodec 硬解的编码白名单（`--hwdec-codecs`）。
+ *
+ * **不要写成 `all`。** `all` 会让 mpv 拿硬件解码器去啃 AVI 里那批老编码
+ * （Xvid / DivX / MPEG-4 ASP，fourCC 常见 XVID / DIVX / MP42）—— 而 AVI 容器
+ * 不把 codec-specific data（VOL 头）放在容器头里，MediaCodec 于是"解码器建起来了、
+ * 一帧也吐不出来"，表现就是**有声音、画面全黑**，而且换内核也未必好使：
+ * 另一条路（ExoPlayer）同样依赖设备的 `video/mp4v-es` 解码器，绝大多数手机没有。
+ *
+ * 这类编码交给 ffmpeg 软解成本极低（480p / 720p 的 Xvid 轻松跑满），所以
+ * mpeg4 / msmpeg4 / wmv / mpeg1 系列一律留在名单外。名单本身取 mpv 自带的
+ * `hwdec-codecs` 默认值，只做加法不做减法，不会削弱 H.264 / HEVC 的硬解。
+ */
+private const val MPV_HWDEC_CODECS = "h264,hevc,mpeg2video,vc1,vp8,vp9,av1"
+
+class MPVView(
+  context: Context,
+  attributes: AttributeSet,
+) : BaseMPVView(context, attributes),
+  KoinComponent {
+  private val audioPreferences: AudioPreferences by inject()
+  private val playerPreferences: PlayerPreferences by inject()
+  private val decoderPreferences: DecoderPreferences by inject()
+  private val advancedPreferences: AdvancedPreferences by inject()
+  private val subtitlesPreferences: SubtitlesPreferences by inject()
+  private val anime4kManager: Anime4KManager by inject()
+
+  var isExiting = false
+
+  fun getVideoOutAspect(): Double? {
+    // Try to get aspect from video-params/aspect first
+    val rawAspect = MPVLib.getPropertyDouble("video-params/aspect")
+    val rotate = MPVLib.getPropertyInt("video-params/rotate") ?: 0
+
+    // If aspect is not available or 0, calculate from width and height
+    val finalAspect = if (rawAspect == null || rawAspect < 0.001) {
+      val width = runCatching {
+        MPVLib.getPropertyInt("width") ?: MPVLib.getPropertyInt("video-params/w") ?: 0
+      }.getOrDefault(0)
+
+      val height = runCatching {
+        MPVLib.getPropertyInt("height") ?: MPVLib.getPropertyInt("video-params/h") ?: 0
+      }.getOrDefault(0)
+
+      if (width > 0 && height > 0) {
+        width.toDouble() / height.toDouble()
+      } else {
+        null
+      }
+    } else {
+      rawAspect
+    }
+
+    return finalAspect?.let { aspect ->
+      if (aspect <= 0.001) {
+        return null
+      }
+      val isRotated = (rotate % 180 == 90)
+      val correctedAspect = if (isRotated) 1.0 / aspect else aspect
+      correctedAspect
+    }
+  }
+
+  class TrackDelegate(
+    private val name: String,
+  ) {
+    operator fun getValue(
+      thisRef: Any?,
+      property: KProperty<*>,
+    ): Int {
+      val v = MPVLib.getPropertyString(name)
+      // we can get null here for "no" or other invalid value
+      return v?.toIntOrNull() ?: -1
+    }
+
+    operator fun setValue(
+      thisRef: Any?,
+      property: KProperty<*>,
+      value: Int,
+    ) {
+      if (value <= 0) MPVLib.setPropertyString(name, "no") else MPVLib.setPropertyInt(name, value)
+    }
+  }
+
+  var sid: Int by TrackDelegate("sid")
+  var secondarySid: Int by TrackDelegate("secondary-sid")
+  var aid: Int by TrackDelegate("aid")
+
+  override fun initOptions() {
+    val profile = decoderPreferences.profile.get()
+    MPVLib.setOptionString("profile", profile)
+    setVo(if (decoderPreferences.gpuNext.get()) "gpu-next" else "gpu")
+
+    // ── 杜比视界 / HDR 输出 ──
+    // 1) DV Profile 5 没有 HDR10 兜底层，只有 gpu-next（libplacebo）会解析 HEVC 流里的
+    //    DV RPU 元数据做色彩映射，旧版 gpu 播 P5 必然紫绿反色（gpuNext 默认已开，见
+    //    DecoderPreferences.gpuNext 的说明）；Profile 7 / 8 的 RPU 同样走这条路。
+    // 2) target-colorspace-hint：HDR / DV 内容时让 libplacebo 按片源提示把显示切进
+    //    HDR 色彩空间（Android 9+ 支持），避免 HDR 片被压到 SDR 亮度区间灰成一片。
+    //    仅 gpu-next 有效；老设备不支持时 mpv 会忽略该提示，无副作用。
+    // ⚠️ 这里**必须显式写 yes / no 两支**，不能只在开启时设一次：
+    //   `setOptionString` 只对 mpv 内部的当前实例生效，而本项目每次进入播放页
+    //   都新建 MPVView，理论上不会串味 —— 但用户中途改设置再进播放器时，
+    //   「没写」与「写了 no」在 mpv 内部走的分支完全不同（前者落回默认值，
+    //   mpv 6.x 的 target-colorspace-hint 默认是 no，两者恰好一致）。
+    //   写成显式二值可以让意图不依赖上游默认值，将来 mpv 改默认也不会连带改变行为。
+    //   另见 DecoderPreferences.hdrEnabled：它与 gpuNext 解耦，正是为了这个开关。
+    val hdrOn = decoderPreferences.hdrEnabled.get()
+    if (decoderPreferences.gpuNext.get()) {
+      MPVLib.setOptionString("target-colorspace-hint", if (hdrOn) "yes" else "no")
+    }
+    
+    // Set GPU API context (Vulkan or OpenGL)
+    if (decoderPreferences.useVulkan.get()) {
+      MPVLib.setOptionString("gpu-context", "androidvk")
+    }
+
+    // Set hwdec with fallback order: HW+ (mediacodec) -> HW (mediacodec-copy) -> SW (no)
+    // 注：Android 上 `mediacodec`（零拷贝）要求 `--vo=mediacodec_embed`，本项目用的是
+    // gpu / gpu-next，所以这一段实际会被跳过，真正生效的是 `mediacodec-copy`，
+    // 最后兜到 `no`（ffmpeg 软解）。
+    MPVLib.setOptionString(
+      "hwdec",
+      if (decoderPreferences.tryHWDecoding.get()) "mediacodec,mediacodec-copy,no" else "no",
+    )
+    // 硬解白名单：**这里不能用 `all`**。
+    // AVI 里那批老视频编码（Xvid / DivX / MPEG-4 ASP，fourCC 常见为 XVID / DIVX / MP42）
+    // 就是被 `all` 坑得最狠的一类：AVI 容器不会把编码的 codec-specific data（VOL 头）
+    // 放在容器头里，而是混在码流里，Android 的 MediaCodec 于是"解码器建起来了、却一帧
+    // 也吐不出来"—— 表现就是**有声音、画面全黑**，而且换内核也不见得好，因为另一条路
+    // （ExoPlayer）同样依赖设备的 `video/mp4v-es` 解码器，绝大多数手机根本没有。
+    // 这类编码交给 ffmpeg 软解成本极低（480p / 720p 的 Xvid 轻松跑满），所以把
+    // mpeg4 / msmpeg4 / wmv / mpeg1 这些统统留在名单外。
+    // 名单本身 = mpv 自带的 hwdec-codecs 默认值，只做加法不做减法，不会削弱 H.264 / HEVC 的硬解。
+    MPVLib.setOptionString("hwdec-codecs", MPV_HWDEC_CODECS)
+
+    if (decoderPreferences.useYUV420P.get()) {
+      MPVLib.setOptionString("vf", "format=yuv420p")
+    }
+    
+    // Cap demuxer cache for mobile to prevent memory issues
+    // ⚠️ **字节上限才是这里真正的闸门**（秒数只是另一个上限，谁先到算谁）。
+    // 下面 64MB 这条线决定了「大文件播起来到底会不会卡」，原因是 mpv 的
+    // `demuxer-max-bytes` 一旦被打满，主线程上的 demux 线程会**停下来等消费者**，
+    // 表现为「拉不动 / 反复 rebuffer / 播放像幻灯片」。
+    val cacheMegs = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) 64 else 32
+    MPVLib.setOptionString("demuxer-max-bytes", "${cacheMegs * 1024 * 1024}")
+    MPVLib.setOptionString("demuxer-max-back-bytes", "${cacheMegs * 1024 * 1024}")
+
+    // ── 远程流（Emby 直连、strm 指向的远端地址…）的缓冲与重连 ──
+    // 这些片子的瓶颈通常在「取数据」而不是「解码」：源是远端 AVI 时，
+    // AVI 的索引在文件尾部，播放器要反复回头读；一旦中间那层（Emby 中转、远端服务器）
+    // 抖动或断一下，画面就卡住甚至再也不动 —— 观感上就是「软解卡得动不了」。
+    // 所以把预读和重连都拉起来：抖动能自愈，不要一路卡到用户重进页面。
+    // ⚠️ **单位是「秒」，但真正的上限是上面那 64MB 字节**。
+    // 这两个 30 秒在 5Mbps 的番剧上只占 ~19MB（无害），而在用户那种
+    // **70GB / 4K 原盘（如 6~15MB/s = 50~120Mbps）** 上，
+    // 30 秒 ≈ 180MB ~ 450MB —— 远远超过 64MB 的字节闸门，
+    // 于是 mpv 永远处于「缓存被打满」的状态：readahead 反复停等、
+    // 播放位置一抖就整段重新取数据，观感就是**卡成幻灯片**。
+    // 所以秒数要跟着字节上限一起收：8 秒 × 64MB 的字节闸门正好能容纳
+    // 「码率高到 8MB/s 的 4K 原盘」，同时低码率流仍然拿到充足的抖动量。
+    MPVLib.setOptionString("cache-secs", "8")
+    MPVLib.setOptionString("demuxer-readahead-secs", "8")
+    // 单次网络读取的缓冲区（默认仅 128KiB，高延迟链路上吞吐会很难看）
+    MPVLib.setOptionString("stream-buffer-size", "4MiB")
+    MPVLib.setOptionString("network-timeout", "30")
+    // lavf 的 HTTP 重连：中途断了接着拉，而不是直接判死
+    MPVLib.setOptionString(
+      "stream-lavf-o",
+      "reconnect=1,reconnect_streamed=1,reconnect_delay_max=20",
+    )
+
+    // ── 落盘缓存（清单 #18）──
+    // 上面那几项是**内存**缓冲：进程活着就有，退出就没了 ⇒ 同一片子第二次看
+    // 仍然要从服务器重拉。这里补上落盘那一半。
+    // 三条硬约束（少一条就是「开着但没效果」，而且 mpv **不报错**）：
+    //  · `cache-dir` 必须是**绝对路径**，相对路径会被静默忽略；
+    //  · 目录得**自己先建**，mpv 不会替我们 mkdirs；
+    //  · `cache-persize` 是**每条流**的上限，跟内存那侧（`demuxer-max-bytes`）
+    //    彼此独立 —— 调大它不会让内存缓冲变大。
+    if (playerPreferences.diskCacheEnabled.get()) {
+      val dir = MpvDiskCache.ensureDir(context)
+      if (dir != null) {
+        val limitMb = playerPreferences.diskCacheSizeMb.get()
+          .coerceIn(MpvDiskCache.MIN_SIZE_MB, MpvDiskCache.MAX_SIZE_MB)
+        MPVLib.setOptionString("cache", "yes")
+        MPVLib.setOptionString("cache-dir", dir.absolutePath)
+        MPVLib.setOptionString("cache-persize", "${limitMb}M")
+        // ⚠️ 故意**不**开 `cache-pause`：开了之后一旦服务器不支持 Range 请求
+        // （部分网盘直链、某些 SFTP/FTP 源），mpv 会误判成「缓冲完了」而**永久暂停**，
+        // 表现是画面停在缓冲动画上再也不动。宁可卡一下，也不要这种死局。
+      }
+    }
+    
+    val verbose = advancedPreferences.verboseLogging.get()
+    val logLevel = if (verbose) "v" else "warn"
+    MPVLib.setOptionString("msg-level", "all=$logLevel")
+    // 连诊断日志一起初始化：详细日志开着时，把 mpv 自己那一路（vo 重建 / 硬解重协商 /
+    // 字幕渲染…）落到**应用外部目录**的一份文件里。手机上的第三方 logcat 应用在非 root 下
+    // 读不到别的应用日志，落盘才是能把日志取回来的唯一办法。
+    PlayerDiagLog.configure(context, verbose)
+    PlayerDiagLog.mpvLogPath(context)?.let { MPVLib.setOptionString("log-file", it) }
+
+    MPVLib.setPropertyBoolean("keep-open", true)
+    MPVLib.setPropertyBoolean("input-default-bindings", true)
+
+    MPVLib.setOptionString("tls-verify", "yes")
+    MPVLib.setOptionString("tls-ca-file", "${context.filesDir.path}/cacert.pem")
+
+    val screenshotDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+    screenshotDir.mkdirs()
+    MPVLib.setOptionString("screenshot-directory", screenshotDir.path)
+
+    VideoFilters.entries.forEach {
+      MPVLib.setOptionString(it.mpvProperty, it.preference(decoderPreferences).get().toString())
+    }
+
+    MPVLib.setOptionString("speed", playerPreferences.defaultSpeed.get().toString())
+
+    // ── 解码器侧的通用提速 ──
+    // ① `vd-lavc-dr=yes`（direct rendering）：解码器直接把输出写进 GPU 可读的缓冲，
+    //    少一次整帧拷贝。4K 一帧（YUV420 10bit）约 25MB，这一拷在低端 SoC 上是
+    //    实实在在的十几毫秒 —— 掉帧就是这么来的。
+    //    ⚠️ 它原本被误写在 `applyAnime4KShaders()` 里（只有开着 Anime4K 才生效），
+    //    于是「不开着色器 ⇒ 每条片子都少一层优化」。挪到这里对所有播放生效。
+    MPVLib.setOptionString("vd-lavc-dr", "yes")
+    // ② `vd-lavc-film-grain`：ffmpeg 的胶片颗粒合成策略。
+    //    `cpu` 让**每一帧**都在 CPU 上做一遍颗粒合成 —— 在 1080p 上几乎无感，
+    //    但在 4K 高码率上是一笔很重的每帧开销（大文件卡顿的帮凶之一）。
+    //    `gpu` 把这一步交给 shader（本项目默认 gpu-next，支持），效果等价、代价低得多；
+    //    显卡不支持时会自动退化为不合成而不是报错。
+    MPVLib.setOptionString("vd-lavc-film-grain", "gpu")
+
+    val preciseSeek = playerPreferences.usePreciseSeeking.get()
+    MPVLib.setOptionString("hr-seek", if (preciseSeek) "yes" else "no")
+    MPVLib.setOptionString("hr-seek-framedrop", if (preciseSeek) "no" else "yes")
+
+    // Anime4K shader initialization (MUST be in initOptions, not after file load!)
+    applyAnime4KShaders()
+
+    setupSubtitlesOptions()
+    setupAudioOptions()
+  }
+
+  override fun observeProperties() {
+    for ((name, format) in observedProps) MPVLib.observeProperty(name, format)
+  }
+
+  override fun postInitOptions() {
+    when (decoderPreferences.debanding.get()) {
+      Debanding.None -> {}
+      Debanding.CPU -> MPVLib.command("vf", "add", "@deband:gradfun=radius=12")
+      Debanding.GPU -> MPVLib.setOptionString("deband", "yes")
+    }
+
+    // 这里原来有一段「按 `enabledStatisticsPage` 偏好自动弹出 mpv 统计浮层」的代码，
+    // 已在清单 #19 移除。移除原因不是「统计没用」，而是**它变成了没有入口的功能**：
+    // 设置页那六个 chip（关闭 + 第 1~5 页）被整块删掉之后，唯一还能让它出现的方式
+    // 就是本地偏好里残留着旧值 —— 也就是「升级后凭空弹一个用户不知道怎么关掉的浮层」。
+    // 想要统计浮层的人：写进自己的 `mpv.conf`
+    // （`script-binding stats/display-stats-toggle`），本项目不拦配置。
+    // 对应的 [EngineFeature.STATS] 枚举项也已一并删除（它本来就零读点）。
+  }
+
+  @Suppress("ReturnCount", "DEPRECATION")
+  fun onKey(event: KeyEvent): Boolean {
+    if (event.action == KeyEvent.ACTION_MULTIPLE || KeyEvent.isModifierKey(event.keyCode)) {
+      return false
+    }
+
+    var mapped = keyMapping[event.keyCode]
+    if (mapped == null) {
+      // Fallback to produced glyph
+      if (!event.isPrintingKey) {
+        return false
+      }
+
+      val ch = event.unicodeChar
+      if (ch.and(KeyCharacterMap.COMBINING_ACCENT) != 0) {
+        return false // dead key
+      }
+      mapped = ch.toChar().toString()
+    }
+
+    if (event.repeatCount > 0) {
+      return true
+    }
+
+    val mod: MutableList<String> = mutableListOf()
+    event.isShiftPressed && mod.add("shift")
+    event.isCtrlPressed && mod.add("ctrl")
+    event.isAltPressed && mod.add("alt")
+    event.isMetaPressed && mod.add("meta")
+
+    val action = if (event.action == KeyEvent.ACTION_DOWN) "keydown" else "keyup"
+    mod.add(mapped)
+    MPVLib.command(action, mod.joinToString("+"))
+
+    return true
+  }
+
+  private val observedProps =
+    mapOf(
+      "pause" to MPVLib.MpvFormat.MPV_FORMAT_FLAG,
+      "paused-for-cache" to MPVLib.MpvFormat.MPV_FORMAT_FLAG,
+      "video-params/aspect" to MPVLib.MpvFormat.MPV_FORMAT_DOUBLE,
+      "video-params/w" to MPVLib.MpvFormat.MPV_FORMAT_INT64,
+      "video-params/h" to MPVLib.MpvFormat.MPV_FORMAT_INT64,
+      "eof-reached" to MPVLib.MpvFormat.MPV_FORMAT_FLAG,
+      "user-data/mpvex/show_text" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/toggle_ui" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/show_panel" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/set_button_title" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/reset_button_title" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/toggle_button" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/seek_by" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/seek_to" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/seek_by_with_text" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/seek_to_with_text" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+      "user-data/mpvex/software_keyboard" to MPVLib.MpvFormat.MPV_FORMAT_STRING,
+    )
+
+  private fun setupAudioOptions() {
+    // Disable MPV's automatic audio selection
+    // App will handle track selection manually via TrackSelector to respect user choices
+    MPVLib.setOptionString("alang", "")
+    MPVLib.setOptionString("audio-delay", (audioPreferences.defaultAudioDelay.get() / 1000.0).toString())
+    MPVLib.setOptionString("audio-pitch-correction", audioPreferences.audioPitchCorrection.get().toString())
+    MPVLib.setOptionString("volume-max", (audioPreferences.volumeBoostCap.get() + 100).toString())
+    
+    // 音频滤镜链：夜间模式（dynaudnorm，带强度档）+ 反向立体声（pan）
+    // 统一由 AudioFilters 组装成一条 af，避免两个功能各自 setOptionString("af") 互相覆盖
+    MPVLib.setOptionString(
+      "af",
+      app.marlboroadvance.mpvex.ui.player.engine.AudioFilters
+        .buildAf(audioPreferences, audioPreferences.audioChannels.get()),
+    )
+  }
+
+  // Setup
+  private fun setupSubtitlesOptions() {
+    // Disable MPV's automatic subtitle selection
+    // App will handle track selection manually via TrackSelector to respect user choices
+    MPVLib.setOptionString("slang", "")
+    MPVLib.setOptionString("sub-auto", "no")
+    MPVLib.setOptionString("sub-file-paths", "")
+    MPVLib.setOptionString("subs-fallback", "no")
+
+    val fontsDirPath = "${context.filesDir.path}/fonts/"
+    MPVLib.setOptionString("sub-fonts-dir", fontsDirPath)
+    
+    // Delay and speed for both primary and secondary
+    val subDelay = (subtitlesPreferences.defaultSubDelay.get() / 1000.0).toString()
+    val subSpeed = subtitlesPreferences.defaultSubSpeed.get().toString()
+    MPVLib.setOptionString("sub-delay", subDelay)
+    MPVLib.setOptionString("sub-speed", subSpeed)
+    MPVLib.setOptionString("secondary-sub-delay", subDelay)
+    MPVLib.setOptionString("secondary-sub-speed", subSpeed)
+
+    val preferredFont = subtitlesPreferences.font.get()
+    if (preferredFont.isNotBlank()) {
+      MPVLib.setOptionString("sub-font", preferredFont)
+      MPVLib.setOptionString("secondary-sub-font", preferredFont)
+    }
+    // If blank, MPV uses its default font
+
+    if (subtitlesPreferences.overrideAssSubs.get()) {
+      MPVLib.setOptionString("sub-ass-override", "force")
+      MPVLib.setOptionString("sub-ass-justify", "yes")
+      MPVLib.setOptionString("secondary-sub-ass-override", "force")
+    } else {
+      MPVLib.setOptionString("sub-ass-override", "no")
+      MPVLib.setOptionString("secondary-sub-ass-override", "no")
+    }
+
+    // Typography and styling for both primary and secondary
+    val fontSize = subtitlesPreferences.fontSize.get().toString()
+    val bold = if (subtitlesPreferences.bold.get()) "yes" else "no"
+    val italic = if (subtitlesPreferences.italic.get()) "yes" else "no"
+    val justify = subtitlesPreferences.justification.get().value
+    val textColor = subtitlesPreferences.textColor.get().toColorHexString()
+    val backgroundColor = subtitlesPreferences.backgroundColor.get().toColorHexString()
+    val borderColor = subtitlesPreferences.borderColor.get().toColorHexString()
+    val borderSize = subtitlesPreferences.borderSize.get().toString()
+    val borderStyle = subtitlesPreferences.borderStyle.get().value
+    val shadowOffset = subtitlesPreferences.shadowOffset.get().toString()
+    val subPos = subtitlesPreferences.subPos.get().toString()
+    val subScale = subtitlesPreferences.subScale.get().toString()
+
+    MPVLib.setOptionString("sub-font-size", fontSize)
+    MPVLib.setOptionString("sub-bold", bold)
+    MPVLib.setOptionString("sub-italic", italic)
+    MPVLib.setOptionString("sub-justify", justify)
+    MPVLib.setOptionString("sub-color", textColor)
+    MPVLib.setOptionString("sub-back-color", backgroundColor)
+    MPVLib.setOptionString("sub-border-color", borderColor)
+    MPVLib.setOptionString("sub-border-size", borderSize)
+    MPVLib.setOptionString("sub-border-style", borderStyle)
+    MPVLib.setOptionString("sub-shadow-offset", shadowOffset)
+    MPVLib.setOptionString("sub-scale", subScale)
+    MPVLib.setOptionString("sub-pos", subPos)
+    
+    MPVLib.setOptionString("secondary-sub-font-size", fontSize)
+    MPVLib.setOptionString("secondary-sub-bold", bold)
+    MPVLib.setOptionString("secondary-sub-italic", italic)
+    MPVLib.setOptionString("secondary-sub-justify", justify)
+    MPVLib.setOptionString("secondary-sub-color", textColor)
+    MPVLib.setOptionString("secondary-sub-back-color", backgroundColor)
+    MPVLib.setOptionString("secondary-sub-border-color", borderColor)
+    MPVLib.setOptionString("secondary-sub-border-size", borderSize)
+    MPVLib.setOptionString("secondary-sub-border-style", borderStyle)
+    MPVLib.setOptionString("secondary-sub-shadow-offset", shadowOffset)
+    MPVLib.setOptionString("secondary-sub-scale", subScale)
+    // Position secondary subtitle at top (10) instead of bottom to avoid overlap with primary
+    MPVLib.setOptionString("secondary-sub-pos", "10")
+
+    // 字号基准：跟随画面（sub-scale-with-window=no）→ 字号按画面高度等比，横竖屏一致。
+    // 详见 PlayerActivity.applySubtitlePreferences 里那段说明。
+    val withWindow = if (subtitlesPreferences.followPictureScale.get()) "no" else "yes"
+    MPVLib.setOptionString("sub-scale-with-window", withWindow)
+    MPVLib.setOptionString("secondary-sub-scale-with-window", withWindow)
+    MPVLib.setOptionString("sub-scale-by-window", "yes")
+    MPVLib.setOptionString("secondary-sub-scale-by-window", "yes")
+    // 位置基准：贴画面底部，不落进上下黑边
+    MPVLib.setOptionString("sub-use-margins", "no")
+    MPVLib.setOptionString("secondary-sub-use-margins", "no")
+  }
+
+
+/**
+   * 在 initOptions 阶段挂上 Anime4K shader。
+   *
+   * ⚠️ 这里**只读**已备好的文件，不再做任何拷贝（清单 #20 必修 2）。
+   * 原来这里调 [Anime4KManager.initialize]，它会`assets.list()` + 逐个
+   * `assets.open()` 几十个 .glsl —— 而本方法跑在主线程（mpv 初始化必须在主线程）。
+   * 现在 IO 那一半由 [prepareAnime4KOnIoThread] 在 IO 线程提前做完，
+   * 本方法只负责「把链路字符串写进 mpv 选项」。
+   */
+  fun applyAnime4KShaders() {
+    runCatching {
+      val enabled = decoderPreferences.enableAnime4K.get()
+      val gpuNextActive = decoderPreferences.gpuNext.get()
+      val useVulkan = decoderPreferences.useVulkan.get()
+
+      val shaderChain =
+        anime4kManager.resolveChain(
+          isEnabled = enabled,
+          gpuNextActive = gpuNextActive,
+          useVulkan = useVulkan,
+          modeStr = decoderPreferences.anime4kMode.get(),
+          qualityStr = decoderPreferences.anime4kQuality.get(),
+        )
+
+      if (shaderChain.isEmpty()) return
+
+      // OpenGL-only tuning should not be pushed onto the Vulkan backend.
+      if (!useVulkan) {
+        MPVLib.setOptionString("opengl-pbo", "yes")
+        MPVLib.setOptionString("opengl-early-flush", "no")
+      }
+      // 注：`vd-lavc-dr` 不在这里设 —— 它对所有播放都有益，已挪到 initOptions 的
+      // 「解码器侧通用提速」段（原来放在这里导致「不开 Anime4K 就没这层优化」）。
+
+      // Apply shaders (MUST use setOptionString in initOptions!)
+      MPVLib.setOptionString("glsl-shaders", shaderChain)
+    }.onFailure {
+      // Don't crash - just continue without shaders
+    }
+  }
+
+  /**
+   * 在 IO 线程把 Anime4K 的 shader 从 assets 备到内部存储（清单 #20 必修 2）。
+   *
+   * 必须在 [initialize] 之前调 —— `glsl-shaders` 是 `setOptionString`，
+   * 过了初始化期再设就不生效了。
+   *
+   * 幂等且便宜：有「已拷完」标记文件时只做一次 `exists()` 判断，
+   * 连 `assets.list()` 都不进（[Anime4KManager.prepareOnIoThread] 里的快路径）。
+   */
+  fun prepareAnime4KOnIoThread() {
+ runCatching { anime4kManager.prepareOnIoThread() }
+      .onFailure { Log.w("MPVView", "Anime4K asset prepare failed", it) }
+  }
+}

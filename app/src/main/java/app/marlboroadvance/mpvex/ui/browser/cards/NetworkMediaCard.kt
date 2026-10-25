@@ -1,0 +1,482 @@
+package app.marlboroadvance.mpvex.ui.browser.cards
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import app.marlboroadvance.mpvex.ui.theme.LocalCardCorner
+import app.marlboroadvance.mpvex.domain.network.NetworkFile
+import app.marlboroadvance.mpvex.domain.network.NetworkFileType
+import app.marlboroadvance.mpvex.domain.network.type
+import app.marlboroadvance.mpvex.ui.browser.networkstreaming.photos.NetworkPhotoThumbnail
+import app.marlboroadvance.mpvex.ui.utils.pressDownScale
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * 「单击 + 长按」合成 modifier，把**长按位置（root 坐标）**回传给 [onLongClick]。
+ *
+ * 与 Emby 媒体库那份（`ui/browser/emby/components/EmbyMediaCard.kt` 的 `tapAndLongPress`）
+ * 是同一套做法：用 `detectTapGestures` 而不是 `combinedClickable` —— 后者拿不到手指
+ * 坐标，而长按菜单要「出现在手指旁边」（锚定气泡菜单），不能是居中大卡片。
+ *
+ * 那份是 Emby 文件内的 `private`，这里再写一份而不是放开可见性：两边分属不同
+ * 界面域，各自演进互不牵连（代价只是十几行重复代码）。
+ *
+ * ⚠️ 这一支没有 ripple 按压反馈 —— 长按弹菜单本身已是足够明确的反馈，
+ *    为 ripple 牺牲定位不划算。改用 `pressDownScale()` 补「按下去」的观感
+ *    （挂在**链尾**：缩放不参与布局，也不影响 detectTapGestures 拿到的本地坐标，
+ *    长按菜单的锚点不会因缩放而偏移）。
+ */
+internal fun Modifier.tapAndLongPress(
+  onClick: () -> Unit,
+  onLongClick: ((Offset) -> Unit)?,
+): Modifier = composed {
+  val haptics = LocalHapticFeedback.current
+  var posInRoot by remember { mutableStateOf(Offset.Zero) }
+  this
+    .onGloballyPositioned { posInRoot = it.positionInRoot() }
+    .then(
+      if (onLongClick == null) {
+        Modifier.combinedClickable(onClick = onClick)
+      } else {
+        Modifier.pointerInput(onClick, onLongClick) {
+          detectTapGestures(
+            onTap = { onClick() },
+            onLongPress = { offset ->
+              haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+              onLongClick(posInRoot + offset)
+            },
+          )
+        }
+      },
+    )
+    .pressDownScale()
+}
+
+/**
+ * 网络浏览的**统一网格卡**：文件夹 / 照片 / 视频三态共用一个卡型，
+ * 右上角挂类型小角标（见 [NetworkTypeBadge]）—— SMB/WebDAV 目录经常是
+ * 混合内容，卡片必须在同一屏里说清「这是图片还是视频还是文件夹」。
+ *
+ * 与旧版（文件夹卡 / 视频卡各一套列表卡）的刻意差异：
+ * - **视频不拉缩略图**：网络视频取帧要么整文件下载要么接解码器，都不划算，
+ *   沿用旧视频卡的做法 —— surfaceContainerHigh 底 + 播放图标占位。
+ * - **照片走 [NetworkPhotoThumbnail]**：拉全图 + Coil 采样解码，Crop 填满
+ *   （没有服务端缩放，见 NetworkPhotoImageLoader 的 KDoc）。
+ * - **文件夹封面**（可选）：[coverPath] 非空 = 文件夹里第一张图片的路径，
+ *   用同一套缩略图组件渲染；为空 = 灰色文件夹图标。封面由调用方懒加载提供
+ *   （见 [onCoverNeeded]），本卡只负责渲染。
+ * - **统一 1:1 图区**（[aspectRatio]）：与 Emby 照片卡同一理由 ——
+ *   高度随原图比例浮动的话网格参差不齐。
+ * - **OTHER 不出现**：字幕 / nfo 这类文件网格里直接不渲染（列表视图才显示），
+ *   由调用方过滤；万一传进来也只是个通用文件占位，不会崩。
+ */
+@Composable
+fun NetworkMediaCard(
+  file: NetworkFile,
+  connectionId: Long,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  /** 文件夹封面（第一张图片的 path）；null = 还没有 / 没有图片 / 功能关闭 */
+  coverPath: String? = null,
+  /** 网格标题行数（一行 / 两行 / 全显，走设置项） */
+  titleMaxLines: Int = 1,
+  /**
+   * 文件夹还没有封面时通知调用方去加载（传文件夹 path）。
+   *
+   * ⚠️ 这就是封面的**懒加载触发点**：LazyGrid 只组合可见项，卡片被组合出来
+   *   才会调这里 ⇒ 只有滚到眼前的文件夹才花那次列目录请求。传 null = 不触发
+   *   （用户在设置里关了封面时调用方就不传）。
+   */
+  onCoverNeeded: ((String) -> Unit)? = null,
+  /**
+   * 长按：调用方据此在**手指位置**弹条目操作菜单（重命名 / 删除）。
+   * null = 不挂长按（协议不支持写操作时调用方传 null）。
+   */
+  onLongClick: ((Offset) -> Unit)? = null,
+) {
+  val type = file.type()
+
+  // 文件夹且还没拿到封面时请求一次。重复调是安全的（VM 侧有缓存/在途去重），
+  // 滑走再滑回来会再触发，但命中缓存不再产生网络请求。
+  if (type == NetworkFileType.FOLDER && coverPath == null && onCoverNeeded != null) {
+    LaunchedEffect(file.path) { onCoverNeeded(file.path) }
+  }
+
+  Column(modifier = modifier.fillMaxWidth()) {
+    Card(
+      // 用 tapAndLongPress 而不是 Card(onClick=)：后者接不了长按，更给不了
+      // 长按坐标（菜单要锚在手指旁边）。见 tapAndLongPress 的说明。
+      modifier = Modifier.tapAndLongPress(onClick = onClick, onLongClick = onLongClick),
+      shape = RoundedCornerShape(LocalCardCorner.current),
+      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+      Box(
+        modifier = Modifier
+          .fillMaxWidth()
+          .aspectRatio(1f),
+      ) {
+        when (type) {
+          NetworkFileType.FOLDER -> {
+            // 有封面（文件夹第一张图片）就渲染缩略图，否则回退文件夹图标。
+            // 封面加载中 / 没有图片 / 功能关闭时都是图标，不会留半张图。
+            if (coverPath != null) {
+              NetworkPhotoThumbnail(
+                connectionId = connectionId,
+                path = coverPath,
+                contentDescription = file.name,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+              )
+            } else {
+              Box(
+                modifier = Modifier
+                  .fillMaxSize()
+                  .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                contentAlignment = Alignment.Center,
+              ) {
+                Icon(
+                  Icons.Filled.Folder,
+                  contentDescription = null,
+                  modifier = Modifier.size(44.dp),
+                  tint = MaterialTheme.colorScheme.secondary,
+                )
+              }
+            }
+          }
+
+          NetworkFileType.PHOTO -> {
+            // 网络照片：流式拉全图 + 采样解码，骨架屏 / 失败重试都在组件里。
+            // sign 必须带上 —— AList 的 /d/ 下载口在服务端开启签名时只认它
+            // （不带会被 401，兜底多一次 fs/get）。见 AlistClient 类注释。
+            NetworkPhotoThumbnail(
+              connectionId = connectionId,
+              path = file.path,
+              contentDescription = file.name,
+              modifier = Modifier.fillMaxSize(),
+              contentScale = ContentScale.Crop,
+              sign = file.sign,
+            )
+          }
+
+          NetworkFileType.VIDEO -> {
+            Box(
+              modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+              contentAlignment = Alignment.Center,
+            ) {
+              Icon(
+                Icons.Filled.PlayCircle,
+                contentDescription = null,
+                modifier = Modifier.size(44.dp),
+                tint = MaterialTheme.colorScheme.secondary,
+              )
+            }
+          }
+
+          NetworkFileType.OTHER -> {
+            Box(
+              modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+              contentAlignment = Alignment.Center,
+            ) {
+              Icon(
+                Icons.Filled.InsertDriveFile,
+                contentDescription = null,
+                modifier = Modifier.size(40.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+        }
+
+        NetworkTypeBadge(
+          type = type,
+          modifier = Modifier
+            .align(Alignment.TopEnd)
+            .padding(6.dp),
+        )
+      }
+    }
+
+    Text(
+      text = file.name,
+      style = MaterialTheme.typography.bodyMedium,
+      color = MaterialTheme.colorScheme.onSurface,
+      maxLines = titleMaxLines,
+      overflow = TextOverflow.Ellipsis,
+      modifier = Modifier.padding(top = 6.dp, start = 2.dp, end = 2.dp),
+    )
+
+    // 媒体类卡片给一行副标题（大小 · 日期）；文件夹没有可显示的元数据，不占位
+    val subtitle = networkFileSubtitle(file)
+    if (subtitle != null) {
+      Text(
+        text = subtitle,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(start = 2.dp, end = 2.dp),
+      )
+    }
+  }
+}
+
+/**
+ * 卡片右上角的**类型小角标**：半透明黑底 + 白色小图标，
+ * 压在缩略图 / 占位块上都能看清（照片五颜六色、文件夹是浅色块，都压得住）。
+ *
+ * 网格卡与列表照片行共用这一个组件，两处视觉语言一致。
+ */
+@Composable
+fun NetworkTypeBadge(
+  type: NetworkFileType,
+  modifier: Modifier = Modifier,
+) {
+  val icon = when (type) {
+    NetworkFileType.FOLDER -> Icons.Filled.Folder
+    NetworkFileType.PHOTO -> Icons.Filled.Image
+    NetworkFileType.VIDEO -> Icons.Filled.Movie
+    NetworkFileType.OTHER -> Icons.Filled.InsertDriveFile
+  }
+  Box(
+    modifier = modifier
+      .size(20.dp)
+      .clip(CircleShape)
+      .background(Color.Black.copy(alpha = 0.45f)),
+    contentAlignment = Alignment.Center,
+  ) {
+    Icon(
+      imageVector = icon,
+      contentDescription = type.displayName,
+      modifier = Modifier.size(12.dp),
+      tint = Color.White,
+    )
+  }
+}
+
+/**
+ * 网络照片的**列表行**（列表视图用）：64dp 圆角缩略图 + 名称 + 大小/日期。
+ *
+ * 与网格卡的分工：网格看「脸」，列表看「信息」—— 所以这里额外渲染
+ * 大小 · 日期副标题（[networkFileSubtitle]）。
+ */
+@Composable
+fun NetworkPhotoRow(
+  file: NetworkFile,
+  connectionId: Long,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  onLongClick: ((Offset) -> Unit)? = null,
+) {
+  Card(
+    modifier =
+      modifier
+        .fillMaxWidth()
+        .tapAndLongPress(onClick = onClick, onLongClick = onLongClick),
+    colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+  ) {
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(16.dp),
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Box(
+        modifier = Modifier
+          .size(64.dp)
+          .clip(RoundedCornerShape(LocalCardCorner.current))
+          .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+        contentAlignment = Alignment.Center,
+      ) {
+        NetworkPhotoThumbnail(
+          connectionId = connectionId,
+          path = file.path,
+          contentDescription = file.name,
+          modifier = Modifier.fillMaxSize(),
+          contentScale = ContentScale.Crop,
+          sign = file.sign,
+        )
+        NetworkTypeBadge(
+          type = NetworkFileType.PHOTO,
+          modifier = Modifier
+            .align(Alignment.TopEnd)
+            .padding(4.dp),
+        )
+      }
+      Spacer(modifier = Modifier.width(16.dp))
+      Column(
+        modifier = Modifier.weight(1f),
+      ) {
+        Text(
+          file.name,
+          style = MaterialTheme.typography.titleSmall,
+          color = MaterialTheme.colorScheme.onSurface,
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis,
+        )
+        val subtitle = networkFileSubtitle(file)
+        if (subtitle != null) {
+          Spacer(modifier = Modifier.height(4.dp))
+          Text(
+            subtitle,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 其他文件的**列表行**（字幕 / nfo 等）：纯展示，不可点。
+ *
+ * 这些文件没有「打开」的语义（字幕不能单独播、nfo 是元数据），
+ * 所以不给点击反馈 —— 长得像能点却点不动，比明显不能点更糟。
+ */
+@Composable
+fun NetworkOtherFileRow(
+  file: NetworkFile,
+  modifier: Modifier = Modifier,
+) {
+  Card(
+    modifier = modifier.fillMaxWidth(),
+    colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+  ) {
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(16.dp),
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Box(
+        modifier = Modifier
+          .size(64.dp)
+          .clip(RoundedCornerShape(LocalCardCorner.current))
+          .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+        contentAlignment = Alignment.Center,
+      ) {
+        Icon(
+          Icons.Filled.InsertDriveFile,
+          contentDescription = null,
+          modifier = Modifier.size(36.dp),
+          tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
+      Spacer(modifier = Modifier.width(16.dp))
+      Column(
+        modifier = Modifier.weight(1f),
+      ) {
+        Text(
+          file.name,
+          style = MaterialTheme.typography.titleSmall,
+          color = MaterialTheme.colorScheme.onSurface,
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis,
+        )
+        val subtitle = networkFileSubtitle(file)
+        if (subtitle != null) {
+          Spacer(modifier = Modifier.height(4.dp))
+          Text(
+            subtitle,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 媒体卡片的副标题：「大小 · 日期」，缺哪段就不显示哪段。
+ * 文件夹 / 没有任何元数据的条目返回 null（调用方不占位）。
+ *
+ * ⚠️ **文件夹一律返回 null**：SMB/WebDAV 的目录项经常带着一个lastModified
+ * （建目录/挪动的时间），单独显示成一个孤零零的「10月15」没人看得懂，
+ * 且对「认内容」没有任何帮助 —— 文件夹的封面与名字已经说清它是什么了。
+ *
+ * 纯函数（不读 Composable 状态）：调用点直接拿结果，不参与重组。
+ */
+private fun networkFileSubtitle(file: NetworkFile): String? {
+  if (file.isDirectory) return null
+  val sizeText = if (file.size > 0) formatNetworkFileSize(file.size) else null
+  val dateText = if (file.lastModified > 0) formatNetworkFileDate(file.lastModified) else null
+  return when {
+    sizeText != null && dateText != null -> "$sizeText · $dateText"
+    sizeText != null -> sizeText
+    dateText != null -> dateText
+    else -> null
+  }
+}
+
+private fun formatNetworkFileSize(bytes: Long): String {
+  return when {
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+    bytes < 1024 * 1024 * 1024 -> "${bytes / (1024 * 1024)} MB"
+    else -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+  }
+}
+
+private fun formatNetworkFileDate(timestamp: Long): String {
+  val date = Date(timestamp)
+  // MM/dd 固定数字格式：以前用 "MMM dd"，中文 locale 下会渲染成「12月29」——
+  // 月份被翻成中文、日子后面又没有「日」，读着像个残缺的日期。
+  // 用 Locale.US 保证任何locale 下都是纯 ASCII 的「12/29」。
+  val format = SimpleDateFormat("MM/dd", Locale.US)
+  return format.format(date)
+}

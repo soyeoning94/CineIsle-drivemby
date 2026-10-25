@@ -1,0 +1,942 @@
+package app.marlboroadvance.mpvex.ui.browser.emby.components
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.graphics.graphicsLayer
+import app.marlboroadvance.mpvex.ui.utils.pressDownScale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Emby 海报卡片（2:3 竖版），用于电影、剧集、媒体库封面。
+ *
+ * @param progress 播放进度 0f~1f，null 表示未播放（不显示进度条）
+ * @param isFavorite 是否在右上角显示收藏角标
+ */
+@Composable
+fun EmbyPosterCard(
+  title: String,
+  subtitle: String?,
+  imageUrl: String?,
+  progress: Float?,
+  isFavorite: Boolean,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  onLongClick: ((Offset) -> Unit)? = null,
+  placeholder: ImageVector = Icons.Default.Movie,
+  fallbackImageUrl: String? = null,
+) {
+  Column(modifier = modifier.width(POSTER_WIDTH)) {
+    Card(
+      modifier = Modifier
+        .fillMaxWidth()
+        .aspectRatio(POSTER_RATIO)
+        .then(
+Modifier.tapAndLongPress(onClick = onClick, onLongClick = onLongClick)
+        ),
+      shape = RoundedCornerShape(LocalEmbyAppearance.current.corner),
+      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+      Box(modifier = Modifier.fillMaxSize()) {
+        EmbyImage(
+          url = imageUrl,
+          fallbackUrl = fallbackImageUrl,
+          contentDescription = title,
+          modifier = Modifier.fillMaxSize(),
+          contentScale = ContentScale.Crop,
+          placeholder = placeholder,
+        )
+
+        if (isFavorite) {
+          Surface(
+            modifier = Modifier
+              .align(Alignment.TopEnd)
+              .padding(6.dp),
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+          ) {
+            Icon(
+              imageVector = Icons.Default.Favorite,
+              contentDescription = "已收藏",
+              modifier = Modifier
+                .padding(4.dp)
+                .size(14.dp),
+              tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+          }
+        }
+
+        // 播放进度：贴在海报底部
+        if (progress != null && progress > 0f) {
+          EmbyProgressBar(
+            progress = progress,
+            modifier = Modifier
+              .align(Alignment.BottomStart)
+              .fillMaxWidth()
+              .height(3.dp),
+          )
+        }
+      }
+    }
+
+    Column(modifier = Modifier.padding(top = 6.dp, start = 2.dp, end = 2.dp)) {
+      Text(
+        text = title,
+        style = MaterialTheme.typography.bodyMedium,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.basicMarquee(iterations = Int.MAX_VALUE),
+      )
+      if (!subtitle.isNullOrBlank()) {
+        Text(
+          text = subtitle,
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Emby 横版卡片（16:9），用于继续观看、剧集列表。
+ *
+ * @param progress 播放进度 0f~1f
+ * @param remainingText 左下角剩余时长角标文案（如「剩余 12分30秒」），null 时不显示
+ * @param showPlayButton 是否在封面正中显示播放按钮。首页「继续观看」单击是进详情页而不是
+ *   直接播放，中间那个三角形会让人误以为「点了就播」，所以关闭；历史页仍是点击即播，保留。
+ */
+@Composable
+fun EmbyWideCard(
+  title: String,
+  subtitle: String?,
+  imageUrl: String?,
+  progress: Float?,
+  isFavorite: Boolean,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  onLongClick: ((Offset) -> Unit)? = null,
+  fallbackImageUrl: String? = null,
+  remainingText: String? = null,
+  showPlayButton: Boolean = true,
+) {
+  Column(modifier = modifier.width(WIDE_WIDTH)) {
+    Card(
+      modifier = Modifier
+        .fillMaxWidth()
+        .aspectRatio(WIDE_RATIO)
+        .then(
+Modifier.tapAndLongPress(onClick = onClick, onLongClick = onLongClick)
+        ),
+      shape = RoundedCornerShape(LocalEmbyAppearance.current.corner),
+      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+      Box(modifier = Modifier.fillMaxSize()) {
+        EmbyImage(
+          url = imageUrl,
+          fallbackUrl = fallbackImageUrl,
+          contentDescription = title,
+          modifier = Modifier.fillMaxSize(),
+          contentScale = ContentScale.Crop,
+        )
+
+        // 居中播放按钮：首页「继续观看」不需要（单击进详情页，三角按钮会误导），
+        // 由 showPlayButton 关闭，避免中央那个图标压住剧照主体
+        if (showPlayButton) {
+          Surface(
+            modifier = Modifier
+              .align(Alignment.Center)
+              .size(36.dp),
+            shape = RoundedCornerShape(50),
+            color = Color.Black.copy(alpha = 0.45f),
+          ) {
+            Box(contentAlignment = Alignment.Center) {
+              Icon(
+                imageVector = Icons.Default.PlayArrow,
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(22.dp),
+              )
+            }
+          }
+        }
+
+        // 左下角剩余时长角标，仅「继续观看」等带进度的卡片传入；受角标开关控制
+        if (LocalEmbyAppearance.current.showBadges && !remainingText.isNullOrBlank()) {
+          Surface(
+            modifier = Modifier
+              .align(Alignment.BottomStart)
+              // 留出底部进度条（3dp）空间，避免角标压住进度条
+              .padding(start = 6.dp, bottom = 8.dp),
+            shape = RoundedCornerShape(6.dp),
+            color = MEDIA_BADGE_BG,
+          ) {
+            Text(
+              text = remainingText,
+              style = MaterialTheme.typography.labelSmall,
+              color = Color.White,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+              modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+            )
+          }
+        }
+
+        if (isFavorite) {
+          Surface(
+            modifier = Modifier
+              .align(Alignment.TopEnd)
+              .padding(6.dp),
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+          ) {
+            Icon(
+              imageVector = Icons.Default.Favorite,
+              contentDescription = "已收藏",
+              modifier = Modifier
+                .padding(4.dp)
+                .size(14.dp),
+              tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+          }
+        }
+
+        if (progress != null && progress > 0f) {
+          EmbyProgressBar(
+            progress = progress,
+            modifier = Modifier
+              .align(Alignment.BottomStart)
+              .fillMaxWidth()
+              .height(3.dp),
+          )
+        }
+      }
+    }
+
+    Column(modifier = Modifier.padding(top = 6.dp, start = 2.dp, end = 2.dp)) {
+      Text(
+        text = title,
+        style = MaterialTheme.typography.bodyMedium,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+      )
+      if (!subtitle.isNullOrBlank()) {
+        Text(
+          text = subtitle,
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
+    }
+  }
+}
+
+/**
+ * 媒体卡片展示样式。
+ *
+ * 与 Emby 官方客户端一致，库内列表可在三种样式间切换：
+ * - 海报：竖版 2:3，电影/剧集默认
+ * - 背景图：横版 16:9，剧集单集常用
+ * - 横幅：超宽幅，接近剧照比例
+ */
+enum class EmbyCardStyle(
+  val label: String,
+  val ratio: Float,
+  val width: Dp,
+) {
+  // 海报比例由 2:3 压到 3:4：一行三个时纵向能多显示一行，卡片不再显得又高又大
+  POSTER("海报", 3f / 4f, 110.dp),
+  BACKDROP("背景图", 16f / 9f, 160.dp),
+  BANNER("横幅", 2.9f, 220.dp),
+}
+
+/**
+ * Emby 卡片的统一视觉参数：圆角大小 + 是否显示封面角标。
+ *
+ * 为什么用 CompositionLocal 而不是给每个卡片加参数：卡片被十几处调用
+ * （首页横滑行、媒体库、收藏、演员、详情推荐…），逐个加参数会把签名撑爆，
+ * 而且只要漏传一处，那个页面就会圆角不一致 —— 恰恰违背「统一」的初衷。
+ * 放到 CompositionLocal 里，**在主题层提供一次，全 App 所有卡片自动一致**，
+ * 用户改设置也能立刻全局生效。
+ *
+ * @param corner 卡片圆角
+ * @param showBadges 是否显示封面上的角标（播放进度条 / 作品数）
+ * @param folderIconBlue 文件夹类型图标是否用蓝色（false = 白色，默认）
+ */
+data class EmbyAppearance(
+  val corner: Dp = EMBY_CARD_CORNER,
+  val showBadges: Boolean = true,
+  val folderIconBlue: Boolean = false,
+)
+
+val LocalEmbyAppearance =
+  androidx.compose.runtime.staticCompositionLocalOf { EmbyAppearance() }
+
+/**
+ * 通用媒体卡片。
+ *
+ * @param style 卡片样式（决定宽高比与宽度）
+ * @param progress 播放进度 0f~1f，null 表示未播放
+ * @param fillWidth 为 true 时铺满父级宽度（用于「一行固定 N 个」的网格）；
+ *                  为 false 时使用 [style] 自带的固定宽度（用于横向滚动行）
+ * @param mosaicUrls 多宫格封面：文件夹类条目自身没有封面图，用内部视频的缩略图拼成
+ *                   2×2 宫格（列表非空时优先于 [imageUrl]）
+ */
+@Composable
+fun EmbyMediaCard(
+  title: String,
+  subtitle: String?,
+  imageUrl: String?,
+  progress: Float?,
+  isFavorite: Boolean,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  style: EmbyCardStyle = EmbyCardStyle.POSTER,
+  placeholder: ImageVector = Icons.Default.Movie,
+  fallbackImageUrl: String? = null,
+  fillWidth: Boolean = false,
+  mosaicUrls: List<String>? = null,
+  onLongClick: ((Offset) -> Unit)? = null,
+  /** 左下角角标文案（如演员卡片的「128 部」作品数），null 时不显示 */
+  badgeText: String? = null,
+  /**
+   * 是否为「文件夹 / 容器」类条目：true 时在**左下角**显示一枚文件夹图标。
+   *
+   * 判定由调用方传入（媒体库用 `isFolderLike(item)`，与宫格封面 / 「点进去还是播放」
+   * 同一口径），卡片自身不猜类型。图标**不受「显示封面角标」开关控制** ——
+   * 它是「点进去 / 直接播」的类型区分，关掉角标后两类条目就再也分不出来了。
+   */
+  isFolder: Boolean = false,
+  /** 多选模式下的选中态：压一层主色遮罩 + 左上角对勾 */
+  selected: Boolean = false,
+  /**
+   * 非 null 时，右上角的心形变成**可点的快捷收藏开关**。
+   *
+   * 需求是「卡片右上角心形快捷收藏」：以前红心只是「已收藏」的只读角标，
+   * 想收藏必须长按 → 菜单 → 收藏，三步。传了回调后点心形即可切换，
+   * 已收藏时是实心 + 主色，未收藏时是描边 + 半透明，一眼能分出状态。
+   *
+   * 不传（null）则保持原来的只读行为 —— 首页横滑行、详情页推荐位这类地方
+   * 不需要快捷开关，避免每张卡右上角都挂个可点按钮。
+   */
+  onToggleFavorite: (() -> Unit)? = null,
+  /**
+   * 标题最多显示几行（默认 1，可设 2）。
+   *
+   * 片名很长时一行会被省略号截掉，只认得前半截；给 2 行能看全。
+   * 视图设置里的「标题行数」把它透传进来，其余调用点（首页横滑、详情页推荐…）
+   * 保持默认 1 行不变。
+   */
+  titleMaxLines: Int = 1,
+) {
+  Column(modifier = if (fillWidth) modifier.fillMaxWidth() else modifier.width(style.width)) {
+    Card(
+      modifier = Modifier
+        .fillMaxWidth()
+        .aspectRatio(style.ratio)
+        .then(
+Modifier.tapAndLongPress(onClick = onClick, onLongClick = onLongClick)
+        ),
+      shape = RoundedCornerShape(LocalEmbyAppearance.current.corner),
+      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+      Box(modifier = Modifier.fillMaxSize()) {
+        if (!mosaicUrls.isNullOrEmpty()) {
+          FolderMosaicCover(urls = mosaicUrls)
+        } else {
+          EmbyImage(
+            url = imageUrl,
+            fallbackUrl = fallbackImageUrl,
+            contentDescription = title,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+            placeholder = placeholder,
+          )
+        }
+
+        if (onToggleFavorite != null) {
+          // 快捷收藏开关：始终显示（未收藏是描边 + 半透明白，已收藏是实心 + 主色）。
+          // 用 pointerInput 而不是 IconButton / clickable：前者会把触控区撑到 48dp 压住封面，
+          // 后者要额外引一个 import；这里只需要「点一下别穿透到卡片」，detectTapGestures
+          // 会消费掉事件，父层 Card 的单击就收不到了 —— 正是想要的。
+          // ⚠️ 回调必须过一层 rememberUpdatedState：`pointerInput(Unit)` 的 key 是常量，
+          // 手势协程只在卡片**第一次**组合时启动一次，直接捕获 onToggleFavorite 会把
+          // 那一刻的 lambda 永久焊死 —— 而它闭包里是当时那一条 item（IsFavorite=false）。
+          // 卡片按 Id 复用、组合不重启，于是之后每次点心形都还在按「收藏」算，
+          // **永远取消不掉**（「只能收藏不能取消收藏」）。与播放队列拖拽那个
+          // pointerInput 坑同源：常量 key 的手势里，任何会变的东西都得走最新值。
+          val latestToggleFavorite by rememberUpdatedState(onToggleFavorite)
+          Surface(
+            modifier = Modifier
+              .align(Alignment.TopEnd)
+              .padding(6.dp)
+              .clip(RoundedCornerShape(50))
+              .pointerInput(Unit) { detectTapGestures { latestToggleFavorite?.invoke() } },
+            shape = RoundedCornerShape(50),
+            color = if (isFavorite) {
+              MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f)
+            } else {
+              Color.Black.copy(alpha = 0.32f)
+            },
+          ) {
+            Icon(
+              imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+              contentDescription = if (isFavorite) "取消收藏" else "收藏",
+              modifier = Modifier
+                .padding(5.dp)
+                .size(15.dp),
+              tint = if (isFavorite) {
+                MaterialTheme.colorScheme.onPrimaryContainer
+              } else {
+                Color.White
+              },
+            )
+          }
+        } else if (isFavorite) {
+          Surface(
+            modifier = Modifier
+              .align(Alignment.TopEnd)
+              .padding(6.dp),
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+          ) {
+            Icon(
+              imageVector = Icons.Default.Favorite,
+              contentDescription = "已收藏",
+              modifier = Modifier
+                .padding(4.dp)
+                .size(14.dp),
+              tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+          }
+        }
+
+        if (progress != null && progress > 0f) {
+          EmbyProgressBar(
+            progress = progress,
+            modifier = Modifier
+              .align(Alignment.BottomStart)
+              .fillMaxWidth()
+              .height(3.dp),
+          )
+        }
+
+        // 多选选中态：整卡压一层主色薄遮罩（一眼能看出选了哪些），
+        // 对勾放左上角 —— 右上角已经被收藏红心占了，别叠在一起。
+        if (selected) {
+          Box(
+            modifier = Modifier
+              .fillMaxSize()
+              .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.30f)),
+          )
+          Surface(
+            modifier = Modifier
+              .align(Alignment.TopStart)
+              .padding(6.dp),
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primary,
+          ) {
+            Icon(
+              imageVector = Icons.Default.Check,
+              contentDescription = "已选择",
+              modifier = Modifier
+                .padding(3.dp)
+                .size(14.dp),
+              tint = MaterialTheme.colorScheme.onPrimary,
+            )
+          }
+        }
+
+        // ── 左下角：文件夹类型图标 + 角标 ──
+        // 两者放进**同一个 Row**：文件夹图标永远排最左（用户要求「始终出现在左下角」），
+        // 角标依次排在它右边，于是既不会互相遮挡，也不会被角标挤走位。
+        // 贴在底部进度条（3dp）上方 8dp，避免压住进度条。
+        // ⚠️ 文件夹图标**刻意不受 `showBadges` 控制**：那个开关管的是「播放进度 / 作品数」
+        //    这类装饰信息；而文件夹图标是「点它是进入还是播放」的类型区分 ——
+        //    关掉角标后两类条目就分不出来了，正是这次要解决的问题。
+        val hasBadge = LocalEmbyAppearance.current.showBadges && !badgeText.isNullOrBlank()
+        if (isFolder || hasBadge) {
+          Row(
+            modifier = Modifier
+              .align(Alignment.BottomStart)
+              .padding(start = 6.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+          ) {
+            if (isFolder) {
+              Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = MEDIA_BADGE_BG,
+              ) {
+                Icon(
+                  imageVector = Icons.Default.Folder,
+                  contentDescription = "文件夹",
+                  tint = if (LocalEmbyAppearance.current.folderIconBlue) {
+                    FOLDER_ICON_BLUE
+                  } else {
+                    Color.White
+                  },
+                  modifier = Modifier
+                    .padding(horizontal = 4.dp, vertical = 3.dp)
+                    .size(14.dp),
+                )
+              }
+            }
+            if (hasBadge) {
+              Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = MEDIA_BADGE_BG,
+              ) {
+                Text(
+                  text = badgeText.orEmpty(),
+                  style = MaterialTheme.typography.labelSmall,
+                  color = Color.White,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                  modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+
+    Column(modifier = Modifier.padding(top = 6.dp, start = 2.dp, end = 2.dp)) {
+      Text(
+        text = title,
+        style = MaterialTheme.typography.bodyMedium,
+        maxLines = titleMaxLines.coerceIn(1, 2),
+        overflow = TextOverflow.Ellipsis,
+      )
+      if (!subtitle.isNullOrBlank()) {
+        Text(
+          text = subtitle,
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
+    }
+  }
+}
+
+/** 宫格单格的解码宽度上限。预热与显示共用同一个值 —— 两处不一致会解码两遍、还白占内存 */
+private const val MOSAIC_TILE_MAX_WIDTH = 720
+
+/** 预热新封面最多等多久：某张图卡住也不能让「换封面」永远不发生 */
+private const val MOSAIC_PREWARM_TIMEOUT_MS = 1_500L
+
+/** 新旧封面之间的淡入时长 */
+private const val MOSAIC_SWAP_FADE_MS = 260
+
+/**
+ * 文件夹多宫格封面。
+ *
+ * Emby 的文件夹条目没有自己的封面图，这里用文件夹内前几项子媒体的缩略图拼成宫格，
+ * 一眼能看出里面装的是什么，比一个纯灰色文件夹占位图标有用得多。
+ *
+ * 换图（下拉刷新会换一批随机封面）时**不硬切**，按三步走：
+ *  1. **先把新一批的图解码好**并放进内存缓存（命中缓存几乎瞬时，新图才需要下载）；
+ *  2. 再把新一批从上一批**淡入**上来 —— 旧图全程原样压在下面，所以中间不会露出卡片底色，
+ *     也不会出现「变暗一下」的中间态；
+ *  3. 预热最长只等 [MOSAIC_PREWARM_TIMEOUT_MS]，超时就先换上去，剩下没就绪的图自己补。
+ *
+ * 不做这三步的话，新一批到达的瞬间 4 格会一起变脸、且每格各自从占位底色重新加载
+ * ⇒ 看着就是一闪一闪的（用户原话是「直接替换看起来会一卡一卡的」）。
+ *
+ * - 1 张：直接铺满（不硬凑宫格）
+ * - 2 张：左右并排
+ * - 3 张：上排两张 + 下排一张通栏
+ * - 4 张及以上：2×2 宫格
+ */
+@Composable
+private fun FolderMosaicCover(urls: List<String>) {
+  val target = urls.take(4)
+  // 上层正在显示的一批 / 正在退场（留在下层）的一批；只有换图期间两层会同时绘制
+  var shown by remember { mutableStateOf(target) }
+  var outgoing by remember { mutableStateOf<List<String>?>(null) }
+  val fade = remember { Animatable(1f) }
+
+  LaunchedEffect(target) {
+    // 首次进入（含列表滚动复用）：直接显示，不必预热 —— 这时的 tile 本来就要自己去取，
+    // 再预热一遍会变成同一个地址发两次请求。
+    if (target == shown) return@LaunchedEffect
+    // ① 预热：把新一批都解到内存缓存里（新图此刻才下载；已缓存则几乎瞬时）
+    withTimeoutOrNull(MOSAIC_PREWARM_TIMEOUT_MS) {
+      coroutineScope {
+        target.forEach { url -> launch { prewarmMosaicTile(url) } }
+      }
+    }
+    // ② 淡入替换：旧图留在下层不许动，新图从透明渐到不透明
+    outgoing = shown
+    shown = target
+    fade.snapTo(0f)
+    fade.animateTo(1f, tween(MOSAIC_SWAP_FADE_MS))
+    outgoing = null
+  }
+
+  Box(modifier = Modifier.fillMaxSize()) {
+    // 下层：退场中的旧封面（保持不透明，避免淡入过程中露出卡片底色）
+    outgoing?.let { MosaicTiles(it) }
+    // 上层：当前封面，换图时整体淡入
+    Box(
+      modifier = Modifier
+        .fillMaxSize()
+        .graphicsLayer { alpha = fade.value },
+    ) {
+      MosaicTiles(shown)
+    }
+  }
+}
+
+/**
+ * 预热单格：只为把图塞进 [EmbyImageLoader] 的内存缓存，返回值不要。
+ *
+ * ⚠️ 取消必须原样抛出（不许被 `runCatching` 吞掉）：换代 / 离开页面时这个协程会被取消，
+ * 吞掉取消会让后面的「换图」步骤在已取消的协程里继续跑，画面与状态就对不上了。
+ */
+private suspend fun prewarmMosaicTile(url: String) {
+  try {
+    EmbyImageLoader.load(url, MOSAIC_TILE_MAX_WIDTH)
+  } catch (e: CancellationException) {
+    throw e
+  } catch (_: Exception) {
+    // 预热失败无所谓：真正渲染时 EmbyImage 会再取一次
+  }
+}
+
+/** 宫格本体：按张数决定排版。 */
+@Composable
+private fun MosaicTiles(urls: List<String>) {
+  val tiles = urls.take(4)
+  // 兜底：空列表时什么都不画（直接索引会越界）
+  if (tiles.isEmpty()) return
+  when (tiles.size) {
+    1 -> MosaicTile(tiles[0], Modifier.fillMaxSize())
+
+    2 -> Row(modifier = Modifier.fillMaxSize()) {
+      MosaicTile(tiles[0], Modifier.weight(1f).fillMaxHeight())
+      MosaicTile(tiles[1], Modifier.weight(1f).fillMaxHeight())
+    }
+
+    3 -> Column(modifier = Modifier.fillMaxSize()) {
+      Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        MosaicTile(tiles[0], Modifier.weight(1f).fillMaxHeight())
+        MosaicTile(tiles[1], Modifier.weight(1f).fillMaxHeight())
+      }
+      MosaicTile(tiles[2], Modifier.weight(1f).fillMaxWidth())
+    }
+
+    else -> Column(modifier = Modifier.fillMaxSize()) {
+      Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        MosaicTile(tiles[0], Modifier.weight(1f).fillMaxHeight())
+        MosaicTile(tiles[1], Modifier.weight(1f).fillMaxHeight())
+      }
+      Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        MosaicTile(tiles[2], Modifier.weight(1f).fillMaxHeight())
+        MosaicTile(tiles[3], Modifier.weight(1f).fillMaxHeight())
+      }
+    }
+  }
+}
+
+/** 宫格里的单张缩略图；地址为空时留一块占位底色 */
+@Composable
+private fun MosaicTile(
+  url: String?,
+  modifier: Modifier,
+) {
+  Box(
+    modifier = modifier.background(MaterialTheme.colorScheme.surfaceVariant),
+  ) {
+    if (!url.isNullOrBlank()) {
+      EmbyImage(
+        url = url,
+        contentDescription = null,
+        modifier = Modifier.fillMaxSize(),
+        contentScale = ContentScale.Crop,
+        // 与预热用同一个宽度：内存缓存按 URL 存（不分尺寸），不一致就会解码两遍
+        maxWidth = MOSAIC_TILE_MAX_WIDTH,
+      )
+    }
+  }
+}
+
+/**
+ * 媒体库入口卡片：显示库名与媒体数量。
+ *
+ * @param onLongClick 长按回调（首页用它触发「扫描媒体库」）；不传就是纯单击。
+ */
+@Composable
+fun EmbyLibraryCard(
+  name: String,
+  itemCount: Int?,
+  imageUrl: String?,
+  icon: ImageVector,
+  /** 是否已置顶：右上角钉一枚小图钉。置顶的库固定排在首页最前面 */
+  pinned: Boolean = false,
+  /**
+   * 跟在库名后面的小角标（如聚合库的「3 库聚合」）。
+   *
+   * 与 [itemCount] 的分工：itemCount 是服务端口径的「N 项」，角标是**种类标识** ——
+   * 「这张卡不是普通媒体库」必须一眼可辨，光靠图标不够（用户明确要求过）。
+   * null = 不显示。
+   */
+  badgeText: String? = null,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+  onLongClick: ((Offset) -> Unit)? = null,
+) {
+  Card(
+    modifier = modifier
+      .width(LIBRARY_CARD_WIDTH)
+      .height(LIBRARY_CARD_HEIGHT)
+      .then(
+Modifier.tapAndLongPress(onClick = onClick, onLongClick = onLongClick)
+      ),
+    shape = RoundedCornerShape(LocalEmbyAppearance.current.corner),
+    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+  ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+      EmbyImage(
+        url = imageUrl,
+        contentDescription = name,
+        modifier = Modifier.fillMaxSize(),
+        contentScale = ContentScale.Crop,
+        placeholder = icon,
+      )
+      // 置顶标记：右上角一枚小图钉。置顶的库本来就排在最前面，但这枚钉子能让人
+      // 一眼看出「是哪几个被钉住了」—— 光靠位置看不出是被钉的还是碰巧排前面。
+      if (pinned) {
+        Surface(
+          shape = CircleShape,
+          color = MEDIA_BADGE_BG,
+          modifier = Modifier
+            .align(Alignment.TopEnd)
+            .padding(6.dp),
+        ) {
+          Icon(
+            imageVector = Icons.Filled.PushPin,
+            contentDescription = "已置顶",
+            tint = Color.White,
+            modifier = Modifier
+              .padding(4.dp)
+              .size(14.dp),
+          )
+        }
+      }
+      // 库名不再靠「整片渐变遮罩」压暗，而是直接给文字垫一块实心底色
+      // —— 跟「继续观看」卡片左下角那个「剩余 XX分XX秒」角标同一套做法：
+      // 深蓝底 + 圆角 + 半透明，只盖住文字那一小块。
+      // 好处：遮罩面积从「半张卡片」降到「一小条」，封面主体完整露出来；
+      // 文字一定落在实色底上，不会出现「上半截压在渐变半透明区」的问题。
+      Box(
+        modifier = Modifier
+          .align(Alignment.BottomStart)
+          .fillMaxWidth()
+          .padding(start = 8.dp, end = 8.dp, bottom = 8.dp),
+      ) {
+        Surface(
+            shape = RoundedCornerShape(6.dp),
+            color = MEDIA_BADGE_BG,
+          ) {
+          Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Text(
+              text = name,
+              style = MaterialTheme.typography.titleSmall,
+              color = Color.White,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+            )
+            if (itemCount != null && itemCount > 0) {
+              Text(
+                text = "  $itemCount 项",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.8f),
+                maxLines = 1,
+              )
+            }
+            if (!badgeText.isNullOrBlank()) {
+              Text(
+                text = "  $badgeText",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White,
+                maxLines = 1,
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 简易播放进度条。
+ *
+ * 用 Box 自绘而非 LinearProgressIndicator，避免依赖 Material3 alpha 中仍在变动的
+ * progress 参数签名。
+ */
+@Composable
+fun EmbyProgressBar(
+  progress: Float,
+  modifier: Modifier = Modifier,
+) {
+  Box(modifier = modifier.background(Color.Transparent)) {
+    Box(
+      modifier = Modifier
+        .fillMaxWidth(progress.coerceIn(0f, 1f))
+        .fillMaxSize()
+        .background(MaterialTheme.colorScheme.primary),
+    )
+  }
+}
+
+/** 一行横向滚动的标题栏 */
+@Composable
+fun EmbySectionHeader(
+  title: String,
+  modifier: Modifier = Modifier,
+  action: (@Composable () -> Unit)? = null,
+) {
+  Row(
+    modifier = modifier
+      .fillMaxWidth()
+      .padding(horizontal = 16.dp, vertical = 8.dp),
+    verticalAlignment = Alignment.CenterVertically,
+    horizontalArrangement = Arrangement.SpaceBetween,
+  ) {
+    Text(
+      text = title,
+      style = MaterialTheme.typography.titleMedium,
+    )
+    action?.invoke()
+  }
+}
+
+private val POSTER_WIDTH = 110.dp
+private const val POSTER_RATIO = 2f / 3f
+private val WIDE_WIDTH = 160.dp
+private const val WIDE_RATIO = 16f / 9f
+private val LIBRARY_CARD_WIDTH = 150.dp
+private val LIBRARY_CARD_HEIGHT = 90.dp
+
+/**
+ * 压在封面上的角标底色（库名 / 剩余时长共用一套）。
+ *
+ * 原来是深蓝 `0xFF0B2E5B`，在暖色封面和紫调主题下都显得很跳，换成中性炭黑 ——
+ * 取自 App 暗色背景（`0xFF161217`）那一族的色调，不偏蓝，配白字在任何封面上都稳。
+ * 半透明是为了让底下的封面还能透出一点点，不至于像贴了张死色纸。
+ */
+internal val MEDIA_BADGE_BG = Color(0xFF262229).copy(alpha = 0.85f)
+
+/**
+ * 「蓝色文件夹图标」用的蓝。
+ *
+ * 刻意写死、不取 `colorScheme.primary`：主色随主题/动态取色会变成紫、青、绿，
+ * 那就不再是「蓝色」了；用户要的是一眼能认出的蓝。这个值在 [MEDIA_BADGE_BG]
+ * 的深炭底上仍保持足够亮度，不会糊成一团。
+ */
+internal val FOLDER_ICON_BLUE = Color(0xFF9FC3FF)
+
+/**
+ * 「单击 + 长按」合成 modifier，并把**长按的位置（root 坐标）**回传给 [onLongClick]。
+ *
+ * 用 detectTapGestures 而不是 combinedClickable：后者拿不到手指坐标，而长按菜单
+ * 要「出现在手指点的右边」。代价是这一支没有 ripple 按压反馈 —— 长按弹菜单本身
+ * 已经是足够明确的反馈，为 ripple 牺牲定位不划算。改用 `pressDownScale()` 补「按下去」
+ * 的观感（挂在**链尾**：缩放不参与布局，也不影响 detectTapGestures 拿到的本地坐标，
+ * 长按菜单的锚点不会因缩放而偏移）。
+ */
+private fun Modifier.tapAndLongPress(
+  onClick: () -> Unit,
+  onLongClick: ((Offset) -> Unit)?,
+): Modifier = composed {
+  val haptics = LocalHapticFeedback.current
+  var posInRoot by remember { mutableStateOf(Offset.Zero) }
+  this
+    .onGloballyPositioned { posInRoot = it.positionInRoot() }
+    .then(
+      if (onLongClick == null) {
+        Modifier.combinedClickable(onClick = onClick)
+      } else {
+        Modifier.pointerInput(onClick, onLongClick) {
+          detectTapGestures(
+            onTap = { onClick() },
+            onLongPress = { offset ->
+              // 长按除了原本的事件（弹菜单 / 进选择态），额外给一下轻度震动确认
+              haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+              onLongClick(posInRoot + offset)
+            },
+          )
+        }
+      }
+    )
+    .pressDownScale()
+}

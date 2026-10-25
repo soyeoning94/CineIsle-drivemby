@@ -1,0 +1,113 @@
+# Add project specific ProGuard rules here.
+# You can control the set of applied configuration files using the
+# proguardFiles setting in build.gradle.
+#
+# For more details, see
+#   http://developer.android.com/guide/developing/tools/proguard.html
+
+# If your project uses WebView with JS, uncomment the following
+# and specify the fully qualified class name to the JavaScript interface
+# class:
+#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
+#   public *;
+#}
+
+# Uncomment this to preserve the line number information for
+# debugging stack traces.
+#-keepattributes SourceFile,LineNumberTable
+
+# If you keep the line number information, uncomment this to
+# hide the original source file name.
+#-renamesourcefileattribute SourceFile
+-dontobfuscate
+-keep,allowoptimization class is.xyz.mpv.** { public protected *; }
+-keep,allowoptimization class net.mediaarea.mediainfo.lib.** { public protected *; }
+-keepclassmembers class net.mediaarea.mediainfo.lib.** {
+    native <methods>;
+}
+-dontwarn org.xmlpull.v1.**
+-dontnote org.xmlpull.v1.**
+-dontwarn org.slf4j.impl.StaticLoggerBinder
+
+# SMBJ ProGuard Rules
+# Keep SMBJ classes
+-keep class com.hierynomus.smbj.** { *; }
+-keep class com.hierynomus.mssmb2.** { *; }
+-keep class com.hierynomus.msdtyp.** { *; }
+-keep class com.hierynomus.msfscc.** { *; }
+-keep class com.hierynomus.protocol.** { *; }
+-keep class com.hierynomus.spnego.** { *; }
+-keep class com.hierynomus.ntlm.** { *; }
+-keep class com.hierynomus.security.** { *; }
+
+# JGSS (Kerberos/SPNEGO) - Optional, not needed for basic NTLM auth
+# These are used for domain authentication, which we don't use
+-dontwarn org.ietf.jgss.**
+-dontnote org.ietf.jgss.**
+
+# MBassador (event bus used by SMBJ) - EL (Expression Language) is optional
+-dontwarn net.engio.mbassy.dispatch.el.**
+-dontnote net.engio.mbassy.dispatch.el.**
+-dontwarn javax.el.**
+-dontnote javax.el.**
+
+# Keep MBassador core classes
+-keep class net.engio.mbassy.** { *; }
+
+# BouncyCastle (crypto provider used by SMBJ)
+-keep class org.bouncycastle.** { *; }
+-dontwarn org.bouncycastle.**
+
+# ASN.1 classes
+-keep class com.hierynomus.asn1.** { *; }
+
+# Keep all classes that use reflection or are loaded dynamically
+-keepattributes Signature
+-keepattributes *Annotation*
+-keepattributes InnerClasses
+-keepattributes EnclosingMethod
+
+# Keep serializable classes
+-keepclassmembers class * implements java.io.Serializable {
+    static final long serialVersionUID;
+    private static final java.io.ObjectStreamField[] serialPersistentFields;
+    private void writeObject(java.io.ObjectOutputStream);
+    private void readObject(java.io.ObjectInputStream);
+    java.lang.Object writeReplace();
+    java.lang.Object readResolve();
+}
+
+# UPnPCast (DLNA 投屏)
+-keep class com.yinnho.upnpcast.** { *; }
+-dontwarn com.yinnho.upnpcast.**
+
+# DanmakuFlameMaster（v115 起源码内置，原先 AAR 的 consumer rules 随之失效，必须自己 keep）
+# 引擎内部按字段名/类型直接访问（flags、duration、mTimer 等），混淆会直接崩。
+-keep class master.flame.danmaku.** { *; }
+-dontwarn master.flame.danmaku.**
+-keep class tv.cjump.jni.** { *; }
+-dontwarn tv.cjump.jni.**
+
+# ── GSYVideoPlayer + IJK ──
+# GSY 的播放器 View 由 XML 布局 inflate、内部大量按类名/反射找 manager，
+# 收缩会直接崩；IJK 的 native 方法被裁掉则是「起播就黑屏」。
+-keep class com.shuyu.gsyvideoplayer.** { *; }
+-dontwarn com.shuyu.gsyvideoplayer.**
+-keep class tv.danmaku.ijk.** { *; }
+-dontwarn tv.danmaku.ijk.**
+-keep class moe.codeest.enviews.** { *; }
+-dontwarn moe.codeest.enviews.**
+-keepclassmembers class tv.danmaku.ijk.** {
+    native <methods>;
+}
+# PlayerFactory.setPlayManager(Class) 传的是 Class 对象，类名不能被重命名
+-keep,allowoptimization class com.shuyu.gsyvideoplayer.player.IjkPlayerManager
+-keep,allowoptimization class com.shuyu.gsyvideoplayer.player.Exo2PlayerManager
+# GSY 自带的字幕解析（SRT / WebVTT）走注解 + 工厂，别裁
+-keep class com.shuyu.gsyvideoplayer.subtitle.** { *; }
+-keep,allowoptimization class * implements com.shuyu.gsyvideoplayer.subtitle.GSYSubtitleParser {
+    public <init>(...);
+}
+# AndroidVideoCache（GSY 的边下边播）
+-keep class com.danikula.videocache.** { *; }
+-dontwarn com.danikula.videocache.**

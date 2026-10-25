@@ -1,0 +1,576 @@
+package app.marlboroadvance.mpvex.ui.player
+
+import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import android.support.v4.media.MediaBrowserCompat
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.media.MediaBrowserServiceCompat
+import androidx.media.session.MediaButtonReceiver
+import app.marlboroadvance.mpvex.R
+import app.marlboroadvance.mpvex.ui.player.engine.PlayerLib
+import `is`.xyz.mpv.MPVLib
+import `is`.xyz.mpv.MPVNode
+import app.marlboroadvance.mpvex.preferences.PlayerPreferences
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.inject
+
+/**
+ * Background playback service for mpv with MediaSession integration.
+ */
+class MediaPlaybackService :
+  MediaBrowserServiceCompat(),
+  MPVLib.EventObserver,
+  KoinComponent {
+  companion object {
+    private const val TAG = "MediaPlaybackService"
+    private const val NOTIFICATION_ID = 1
+    private const val NOTIFICATION_CHANNEL_ID = "mpvex_playback_channel"
+
+    @Volatile
+    internal var thumbnail: Bitmap? = null
+    
+    @Volatile
+    private var isServiceRunning = false
+
+    /**
+     * 换掉静态缩略图，并回收旧的那张（清单 #20）。
+     *
+     * 必须是 static 而不是只在实例方法里做，原因是 [app.marlboroadvance.mpvex.ui.player.PlayerActivity]
+     * 在 `startBackgroundPlayback` 里也要换图，而那一刻**服务还没绑定**（`serviceBound == false`），
+     * 根本拿不到实例 —— 原来那行 `MediaPlaybackService.thumbnail = thumbnail` 就是这么写的。
+     *
+     * ⚠️ 必须判 `!==`：`setMediaInfo` 与 `startBackgroundPlayback` 可能拿同一张图来赋值两次，
+     * 提前 recycle 会把还在用的 Bitmap 弄坏（`recycle()` 过再画抛 `IllegalStateException`）。
+     */
+    @JvmStatic
+    fun setStaticThumbnail(bitmap: Bitmap?) {
+      val previous = thumbnail
+      thumbnail = bitmap
+      if (previous !== bitmap) {
+        previous?.let { if (!it.isRecycled) it.recycle() }
+      }
+    }
+
+    fun createNotificationChannel(context: Context) {
+      val channel =
+        NotificationChannel(
+          NOTIFICATION_CHANNEL_ID,
+          context.getString(R.string.notification_channel_name),
+          NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+          description = context.getString(R.string.notification_channel_description)
+          setShowBadge(false)
+          enableLights(false)
+          enableVibration(false)
+        }
+
+      (context.getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+        .createNotificationChannel(channel)
+    }
+  }
+
+  private val binder = MediaPlaybackBinder()
+  private lateinit var mediaSession: MediaSessionCompat
+  private val playerPreferences: PlayerPreferences by inject()
+
+  private var mediaTitle = ""
+  private var mediaArtist = ""
+  private var paused = false
+  private var lastNotificationUpdateTime = 0L
+  private val notificationUpdateIntervalMs = 1000L // Update notification every 1 second
+
+  inner class MediaPlaybackBinder : Binder() {
+    fun getService() = this@MediaPlaybackService
+  }
+
+  override fun onCreate() {
+    super.onCreate()
+    Log.d(TAG, "Service created")
+    
+    isServiceRunning = true
+
+    // Ensure notification channel exists before starting foreground service
+    createNotificationChannel(this)
+
+    setupMediaSession()
+    
+    // Only add MPV observer if MPV is initialized
+    try {
+      PlayerLib.addObserver(this)
+      // Observe properties（GSY 内核下这些是空操作：状态由 GsyBackend 主动推送）
+      PlayerLib.observeProperty("pause", MPVLib.MpvFormat.MPV_FORMAT_FLAG)
+      PlayerLib.observeProperty("media-title", MPVLib.MpvFormat.MPV_FORMAT_STRING)
+      PlayerLib.observeProperty("metadata/artist", MPVLib.MpvFormat.MPV_FORMAT_STRING)
+      PlayerLib.observeProperty("time-pos", MPVLib.MpvFormat.MPV_FORMAT_DOUBLE)
+      Log.d(TAG, "MPV observer registered")
+    } catch (e: Exception) {
+      Log.e(TAG, "Error registering MPV observer", e)
+    }
+  }
+
+  override fun onBind(intent: Intent): IBinder = binder
+
+  @SuppressLint("ForegroundServiceType")
+  override fun onStartCommand(
+    intent: Intent?,
+    flags: Int,
+    startId: Int,
+  ): Int {
+    Log.d(TAG, "Service starting with startId: $startId")
+
+    // Handle media button events
+    intent?.let {
+      MediaButtonReceiver.handleIntent(mediaSession, it)
+      
+      // Get media info from intent extras if available
+      val title = it.getStringExtra("media_title")
+      val artist = it.getStringExtra("media_artist")
+      
+      if (!title.isNullOrBlank()) {
+        mediaTitle = title
+        mediaArtist = artist ?: ""
+        Log.d(TAG, "Media info from intent: $mediaTitle")
+      }
+    }
+
+    // Fallback: Read current state from MPV if not provided via intent
+    // （mpv 的 media-title 可能是整条播放直链，通知栏 / 媒体会话不能显示 api_key）
+    if (mediaTitle.isBlank()) {
+      mediaTitle = redactUrlSecrets(PlayerLib.getPropertyString("media-title")).orEmpty()
+      mediaArtist = PlayerLib.getPropertyString("metadata/artist") ?: ""
+    }
+    
+    paused = PlayerLib.getPropertyBoolean("pause") == true
+
+    updateMediaSession()
+
+    // Always start as foreground service with notification (like YouTube)
+    try {
+      val type =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+          0
+        }
+      ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), type)
+      Log.d(TAG, "Foreground service started successfully")
+    } catch (e: Exception) {
+      Log.e(TAG, "Error starting foreground service", e)
+    }
+
+    // Return START_NOT_STICKY so service doesn't restart if killed
+    return START_NOT_STICKY
+  }
+
+  override fun onGetRoot(
+    clientPackageName: String,
+    clientUid: Int,
+    rootHints: android.os.Bundle?,
+  ) = BrowserRoot("root_id", null)
+
+  override fun onLoadChildren(
+    parentId: String,
+    result: Result<MutableList<MediaBrowserCompat.MediaItem>>,
+  ) {
+    result.sendResult(mutableListOf())
+  }
+
+  fun setMediaInfo(
+    title: String,
+    artist: String,
+    thumbnail: Bitmap? = null,
+  ) {
+    // ⚠️ 旧图回收在 [setStaticThumbnail] 里做（清单 #20）。
+    // 原来只是直接覆盖赋值，而 PlayerActivity 会在「元数据更新」路径上反复调
+    // `setMediaInfo`（切集、追剧信息刷新…），每次都 `grabThumbnail(1080)` 抓一张
+    // 约 2.6MB 的新图 —— 旧图既没人引用也没 recycle，纯靠 GC 何时回收全看运气。
+    // 连播几十集就是几十张 1080 宽的图在等 GC，很容易 OOM。
+    setStaticThumbnail(thumbnail)
+
+    mediaTitle = title
+    mediaArtist = artist
+    updateMediaSession()
+  }
+
+  /**
+   * 回收并清空静态缩略图（清单 #20）。
+   *
+   * 单独抽出来是因为**有三个地方要做同一件事**（`setMediaInfo` 换图、
+   * `onDestroy`、`onTaskRemoved`），而漏掉任何一处都会让 2.6MB 留在 native 堆上。
+   *
+   * ⚠️ 调用方必须保证「已经没人再拿这张图去画」——
+   * 通知栏的 `LargeIcon` 与 `MediaMetadataCompat` 持有的是**同一个实例**，
+   * 所以这个函数只能在这两样都撤掉之后调。
+   */
+  private fun releaseThumbnail() {
+    val current = thumbnail
+    thumbnail = null
+    current?.let { if (!it.isRecycled) it.recycle() }
+  }
+
+  private fun setupMediaSession() {
+    mediaSession =
+      MediaSessionCompat(this, TAG).apply {
+        setCallback(
+          object : MediaSessionCompat.Callback() {
+            override fun onPlay() {
+              Log.d(TAG, "onPlay called")
+              PlayerLib.setPropertyBoolean("pause", false)
+            }
+
+            override fun onPause() {
+              Log.d(TAG, "onPause called")
+              PlayerLib.setPropertyBoolean("pause", true)
+            }
+
+            override fun onStop() {
+              Log.d(TAG, "onStop called")
+              stopSelf()
+            }
+
+            override fun onSkipToNext() {
+              Log.d(TAG, "onSkipToNext called")
+              // Use precise seeking for videos shorter than 2 minutes (120 seconds) or if preference is enabled
+              val duration = PlayerLib.getPropertyInt("duration") ?: 0
+              val shouldUsePreciseSeeking = playerPreferences.usePreciseSeeking.get() || duration < 120
+              val seekMode = if (shouldUsePreciseSeeking) "relative+exact" else "relative+keyframes"
+              PlayerLib.command("seek", "10", seekMode)
+            }
+
+            override fun onSkipToPrevious() {
+              Log.d(TAG, "onSkipToPrevious called")
+              // Use precise seeking for videos shorter than 2 minutes (120 seconds) or if preference is enabled
+              val duration = PlayerLib.getPropertyInt("duration") ?: 0
+              val shouldUsePreciseSeeking = playerPreferences.usePreciseSeeking.get() || duration < 120
+              val seekMode = if (shouldUsePreciseSeeking) "relative+exact" else "relative+keyframes"
+              PlayerLib.command("seek", "-10", seekMode)
+            }
+
+            override fun onSeekTo(pos: Long) {
+              Log.d(TAG, "onSeekTo called: $pos")
+              PlayerLib.setPropertyDouble("time-pos", pos / 1000.0)
+            }
+          },
+        )
+
+        // Set flags to handle media buttons and transport controls
+        @Suppress("DEPRECATION")
+        setFlags(
+          MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+            MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
+        )
+
+        isActive = true
+      }
+    sessionToken = mediaSession.sessionToken
+  }
+
+  private fun updateMediaSession() {
+    try {
+      // Ensure we have valid media title
+      val title = mediaTitle.ifBlank { "Unknown Video" }
+      
+      // Update metadata
+      val duration = runCatching { 
+        PlayerLib.getPropertyDouble("duration")?.times(1000)?.toLong() 
+      }.getOrNull() ?: 0L
+      
+      val metadataBuilder =
+        MediaMetadataCompat
+          .Builder()
+          .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+          .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, mediaArtist)
+          .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_TITLE, title)
+          .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration)
+
+      thumbnail?.let {
+        metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, it)
+        metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, it)
+      }
+      mediaSession.setMetadata(metadataBuilder.build())
+
+      // Update playback state
+      val position = runCatching { 
+        PlayerLib.getPropertyDouble("time-pos")?.times(1000)?.toLong() 
+      }.getOrNull() ?: 0L
+      
+      val state = if (paused) PlaybackStateCompat.STATE_PAUSED else PlaybackStateCompat.STATE_PLAYING
+
+      mediaSession.setPlaybackState(
+        PlaybackStateCompat
+          .Builder()
+          .setActions(
+            PlaybackStateCompat.ACTION_PLAY or
+              PlaybackStateCompat.ACTION_PAUSE or
+              PlaybackStateCompat.ACTION_PLAY_PAUSE or
+              PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+              PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+              PlaybackStateCompat.ACTION_STOP or
+              PlaybackStateCompat.ACTION_SEEK_TO,
+          ).setState(state, position, 1.0f)
+          .build(),
+      )
+
+      // Update notification
+      updateNotification()
+    } catch (e: Exception) {
+      Log.e(TAG, "Error updating MediaSession", e)
+    }
+  }
+
+  private fun updateNotification() {
+    try {
+      val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+      notificationManager.notify(NOTIFICATION_ID, buildNotification())
+    } catch (e: Exception) {
+      Log.e(TAG, "Error updating notification", e)
+    }
+  }
+
+  private fun buildNotification(): Notification {
+    val openAppIntent =
+      Intent(this, PlayerActivity::class.java).apply {
+        flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+      }
+    val pendingIntent =
+      PendingIntent.getActivity(
+        this,
+        0,
+        openAppIntent,
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+      )
+
+    // Create notification actions
+    val previousAction =
+      NotificationCompat.Action(
+        android.R.drawable.ic_media_previous,
+        "Previous",
+        MediaButtonReceiver.buildMediaButtonPendingIntent(
+          this,
+          PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS,
+        ),
+      )
+
+    val playPauseAction =
+      NotificationCompat.Action(
+        if (paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
+        if (paused) "Play" else "Pause",
+        MediaButtonReceiver.buildMediaButtonPendingIntent(
+          this,
+          PlaybackStateCompat.ACTION_PLAY_PAUSE,
+        ),
+      )
+
+    val nextAction =
+      NotificationCompat.Action(
+        android.R.drawable.ic_media_next,
+        "Next",
+        MediaButtonReceiver.buildMediaButtonPendingIntent(
+          this,
+          PlaybackStateCompat.ACTION_SKIP_TO_NEXT,
+        ),
+      )
+
+    return NotificationCompat
+      .Builder(this, NOTIFICATION_CHANNEL_ID)
+      .setContentTitle(mediaTitle.ifBlank { "Unknown Video" })
+      .setContentText(mediaArtist.ifBlank { getString(R.string.notification_playing) })
+      .setSmallIcon(R.drawable.ic_launcher_foreground)
+      .setLargeIcon(thumbnail)
+      .setContentIntent(pendingIntent)
+      .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+      .setOnlyAlertOnce(true)
+      .setOngoing(!paused)
+      .addAction(previousAction)
+      .addAction(playPauseAction)
+      .addAction(nextAction)
+      .setStyle(
+        androidx.media.app.NotificationCompat
+          .MediaStyle()
+          .setMediaSession(mediaSession.sessionToken)
+          .setShowActionsInCompactView(0, 1, 2),
+      ).setPriority(NotificationCompat.PRIORITY_LOW)
+      .build()
+  }
+
+  // ==================== MPV Event Observers ====================
+
+  override fun eventProperty(property: String) {}
+
+  override fun eventProperty(
+    property: String,
+    value: Long,
+  ) {}
+
+  override fun eventProperty(
+    property: String,
+    value: Boolean,
+  ) {
+    if (property == "pause") {
+      paused = value
+      updateMediaSession()
+    }
+  }
+
+  override fun eventProperty(
+    property: String,
+    value: String,
+  ) {
+    when (property) {
+      "media-title" -> {
+        if (value.isNotBlank()) {
+          mediaTitle = value
+          updateMediaSession()
+        }
+      }
+      "metadata/artist" -> {
+        mediaArtist = value
+        updateMediaSession()
+      }
+    }
+  }
+
+  override fun eventProperty(
+    property: String,
+    value: Double,
+  ) {
+    if (property == "time-pos") {
+      // Throttle notification updates to avoid excessive updates
+      val currentTime = System.currentTimeMillis()
+      if (currentTime - lastNotificationUpdateTime >= notificationUpdateIntervalMs) {
+        lastNotificationUpdateTime = currentTime
+        updateMediaSession()
+      }
+    }
+  }
+
+  override fun eventProperty(
+    property: String,
+    value: MPVNode,
+  ) {}
+
+  override fun event(eventId: Int, data: MPVNode) {
+    if (eventId == MPVLib.MpvEvent.MPV_EVENT_SHUTDOWN) {
+      Log.d(TAG, "MPV shutdown event received, stopping service")
+      stopSelf()
+    }
+  }
+
+  override fun onDestroy() {
+    try {
+      Log.d(TAG, "Service destroyed")
+
+      isServiceRunning = false
+      
+      // Remove MPV observer safely
+      try {
+        PlayerLib.removeObserver(this)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error removing MPV observer", e)
+      }
+      
+      // Stop foreground and remove notification explicitly
+      try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+          stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+          @Suppress("DEPRECATION")
+          stopForeground(true)
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error stopping foreground", e)
+      }
+      
+      // Cancel notification explicitly to ensure cleanup
+      try {
+        val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(NOTIFICATION_ID)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error canceling notification", e)
+      }
+      
+      // Release media session
+      try {
+        mediaSession.isActive = false
+        mediaSession.release()
+      } catch (e: Exception) {
+        Log.e(TAG, "Error releasing media session", e)
+      }
+      
+      // 回收缩略图（清单 #20）。原来只是 `thumbnail = null` —— 那只是**解引用**，
+      // 不是回收，2.6MB 的 native 内存仍然挂着。
+      // 位置在 `releaseMediaSession()` 之后是对的：通知栏的 LargeIcon 还持有同一个实例，
+      // 先 recycle 会让系统画通知时抛 `IllegalStateException`。
+      releaseThumbnail()
+
+      Log.d(TAG, "Service cleanup completed")
+      super.onDestroy()
+    } catch (e: Exception) {
+      Log.e(TAG, "Error in onDestroy", e)
+      super.onDestroy()
+    }
+  }
+
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    Log.d(TAG, "Task removed - killing playback and cleaning up service")
+    try {
+      // Kill MPV playback immediately when task is removed
+      try {
+        PlayerLib.command("quit")
+        Log.d(TAG, "MPV quit command sent")
+      } catch (e: Exception) {
+        Log.e(TAG, "Error sending quit command to MPV", e)
+      }
+      
+      // Stop foreground and remove notification when task is removed
+      try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+          stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+          @Suppress("DEPRECATION")
+          stopForeground(true)
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error stopping foreground in onTaskRemoved", e)
+      }
+      
+      // Cancel notification explicitly
+      try {
+        val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(NOTIFICATION_ID)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error canceling notification in onTaskRemoved", e)
+      }
+      
+      // 回收缩略图（清单 #20）。必须在 `notificationManager.cancel()` **之后** ——
+      // 通知还没撤的时候系统可能正在拿这张图去画，recycle 掉会抛异常。
+      releaseThumbnail()
+      
+      // Stop the service which will trigger cleanup
+      stopSelf()
+      
+      // Force kill the process to ensure everything stops
+      android.os.Process.killProcess(android.os.Process.myPid())
+    } catch (e: Exception) {
+      Log.e(TAG, "Error in onTaskRemoved", e)
+      // Force kill even if there's an error
+      android.os.Process.killProcess(android.os.Process.myPid())
+    }
+    super.onTaskRemoved(rootIntent)
+  }
+}

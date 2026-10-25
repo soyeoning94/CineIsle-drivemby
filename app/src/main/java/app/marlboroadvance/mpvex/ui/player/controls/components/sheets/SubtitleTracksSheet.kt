@@ -1,0 +1,150 @@
+package app.marlboroadvance.mpvex.ui.player.controls.components.sheets
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import app.marlboroadvance.mpvex.R
+import app.marlboroadvance.mpvex.ui.player.TrackNode
+import app.marlboroadvance.mpvex.ui.theme.spacing
+import kotlinx.collections.immutable.ImmutableList
+import kotlinx.collections.immutable.toImmutableList
+
+sealed class SubtitleItem {
+  data class Track(val node: TrackNode) : SubtitleItem()
+  data class Header(val title: String) : SubtitleItem()
+  object Divider : SubtitleItem()
+}
+
+@Composable
+fun SubtitlesSheet(
+  tracks: ImmutableList<TrackNode>,
+  onToggleSubtitle: (Int) -> Unit,
+  isSubtitleSelected: (Int) -> Boolean,
+  onAddSubtitle: () -> Unit,
+  /**
+   * 打开「在线字幕搜索」（Emby 字幕源）。默认关闭 —— 非 Emby 播放（本地文件 /
+   * 网盘直链）没有 itemId 和服务端，在线搜索对它无意义，传 null 就自动隐藏。
+   */
+  onSearchOnline: (() -> Unit)? = null,
+  onOpenSubtitleSettings: () -> Unit,
+  onOpenSubtitleDelay: () -> Unit,
+  onRemoveSubtitle: (Int) -> Unit,
+  onDismissRequest: () -> Unit,
+  modifier: Modifier = Modifier
+) {
+  val items = remember(tracks) {
+    val list = mutableListOf<SubtitleItem>()
+    
+    // Internal/Local tracks section
+    val internal = tracks.filter { it.external != true }
+    val external = tracks.filter { it.external == true }
+    
+    if (internal.isNotEmpty() || external.isNotEmpty()) {
+        list.add(SubtitleItem.Header(if (internal.isNotEmpty()) "内嵌字幕" else "本地字幕"))
+        list.addAll(internal.map { SubtitleItem.Track(it) })
+        if (internal.isNotEmpty() && external.isNotEmpty()) {
+          list.add(SubtitleItem.Header("外挂字幕"))
+        }
+        list.addAll(external.map { SubtitleItem.Track(it) })
+    }
+
+    list.toImmutableList()
+  }
+
+  GenericTracksSheet(
+    tracks = items,
+    onDismissRequest = onDismissRequest,
+    header = {
+      AddTrackRow(
+        stringResource(R.string.player_sheets_add_ext_sub),
+        onAddSubtitle,
+        actions = {
+          // 在线搜索放在 actions 里而不是单独一行：这一行右侧已经有
+          // 「调色板 / 延迟」两个图标，再塞一个文字按钮会被 Row 压扁
+          //（中文按钮排不下的经典原因，见项目红线 9）。
+          if (onSearchOnline != null) {
+            IconButton(onClick = onSearchOnline) {
+              Icon(Icons.Default.CloudDownload, contentDescription = "在线字幕")
+            }
+          }
+          IconButton(onClick = onOpenSubtitleSettings) {
+            Icon(Icons.Default.Palette, null)
+          }
+          IconButton(onClick = onOpenSubtitleDelay) {
+            Icon(Icons.Default.MoreTime, null)
+          }
+        },
+      )
+    },
+    track = { item ->
+      when (item) {
+        is SubtitleItem.Track -> {
+          val track = item.node
+          SubtitleTrackRow(
+            title = getTrackTitle(track),
+            isSelected = isSubtitleSelected(track.id),
+            isExternal = track.external == true,
+            onToggle = { onToggleSubtitle(track.id) },
+            onRemove = { onRemoveSubtitle(track.id) },
+          )
+        }
+        is SubtitleItem.Header -> {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = MaterialTheme.spacing.medium, vertical = MaterialTheme.spacing.extraSmall),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = item.title,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+        SubtitleItem.Divider -> {
+            HorizontalDivider(
+              modifier = Modifier.padding(horizontal = MaterialTheme.spacing.medium, vertical = MaterialTheme.spacing.small),
+              color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+            )
+        }
+      }
+    },
+    footer = {
+      Spacer(modifier = Modifier.height(MaterialTheme.spacing.medium))
+    },
+    modifier = modifier,
+  )
+}
+
+@Composable
+fun SubtitleTrackRow(
+  title: String,
+  isSelected: Boolean,
+  isExternal: Boolean,
+  onToggle: () -> Unit,
+  onRemove: () -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  Row(
+    modifier = modifier.fillMaxWidth().clickable(onClick = onToggle).padding(horizontal = MaterialTheme.spacing.medium, vertical = MaterialTheme.spacing.extraSmall),
+    verticalAlignment = Alignment.CenterVertically,
+    horizontalArrangement = Arrangement.spacedBy(MaterialTheme.spacing.smaller),
+  ) {
+    Checkbox(checked = isSelected, onCheckedChange = { onToggle() })
+    Text(title, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal, modifier = Modifier.weight(1f))
+    if (isExternal) {
+      IconButton(onClick = onRemove) { Icon(Icons.Default.Delete, contentDescription = null) }
+    }
+  }
+}

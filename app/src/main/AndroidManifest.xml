@@ -1,0 +1,510 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"
+        tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!--
+        Android 11+ 的包可见性：详情页的「用外部播放器打开」要先问系统
+        「还有谁能打开 video/*」，才能把自家播放页以外的候选列进选择器。
+        少了这一段，queryIntentActivities 会一直返回空。
+
+        只声明一条不带 scheme 的是**不够的**：Emby 的流地址是 https://…，
+        而 intent 匹配要求 scheme 也对得上 —— 只注册了 file / content 的播放器
+        会因为 scheme 不匹配整个消失，列表里就只剩「视频」这种声明得最宽的系统播放器。
+        这里把常见 scheme 逐个声明一遍，再补上常用播放器的包名。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="content" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="file" />
+            <data android:mimeType="video/*" />
+        </intent>
+
+        <!--
+            常见播放器包名。要与 ExternalPlayers.kt 里的 KNOWN_EXTERNAL_PLAYERS
+            一一对应 —— 那边少一条，这里对应的播放器在 Android 11+ 上就可能探测不到。
+        -->
+        <package android:name="com.mxtech.videoplayer.pro" />
+        <package android:name="com.mxtech.videoplayer.ad" />
+        <package android:name="org.videolan.vlc" />
+        <package android:name="com.newin.nplayer.pro" />
+        <package android:name="com.brouken.player" />
+        <package android:name="is.xyz.mpv" />
+        <package android:name="org.xbmc.kodi" />
+        <package android:name="com.kmplayer" />
+        <package android:name="com.plexapp.android" />
+        <package android:name="com.emby.mobile" />
+        <package android:name="org.jellyfin.mobile" />
+    </queries>
+
+    <application
+        android:name=".App"
+        android:appCategory="video"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:requestLegacyExternalStorage="true"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.mpvex"
+        android:largeHeap="true"
+        android:hardwareAccelerated="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:targetApi="35">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.mpvex">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          桌面图标切换用的 activity-alias（外观 → 桌面图标）。
+
+          ⚠️ Android 的桌面图标只能是 APK 内的静态资源，不能从网络下载 ——
+            所以「换图标」只有这一条路：为每套图标开一个 alias，运行时用
+            PackageManager.setComponentEnabledSetting 启用其中一个、禁用其余。
+            见 ui/preferences/AppIconManager.kt。
+
+          ⚠️ 每个 alias 都必须自带一份 MAIN/LAUNCHER filter，缺了就不出现在桌面。
+          ⚠️ android:targetActivity 指向 MainActivity，进程与单例行为完全不变，
+            所以切换不���「另一个 App」，只是换了个壳。
+        -->
+        <activity-alias
+            android:name=".MainActivityAliasDeepSea"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_deepsea"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_deepsea"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityAliasMidnight"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_midnight"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_midnight"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityAliasMinimal"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_minimal"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_minimal"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityAliasAmber"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_amber"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_amber"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity
+            android:name=".ui.player.PlayerActivity"
+            android:autoRemoveFromRecents="true"
+            android:noHistory="false"
+            android:excludeFromRecents="false"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:documentLaunchMode="never"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:theme="@style/Theme.mpvex">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="*/rmvb" />
+                <data android:mimeType="*/avi" />
+                <data android:mimeType="*/mkv" />
+                <data android:mimeType="application/3gpp*" />
+                <data android:mimeType="application/mp4" />
+                <data android:mimeType="application/mpeg*" />
+                <data android:mimeType="application/ogg" />
+                <data android:mimeType="application/sdp" />
+                <data android:mimeType="application/vnd.3gp*" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/vnd.dvd*" />
+                <data android:mimeType="application/vnd.dolby*" />
+                <data android:mimeType="application/vnd.rn-realmedia*" />
+                <data android:mimeType="application/x-extension-mp4" />
+                <data android:mimeType="application/x-flac" />
+                <data android:mimeType="application/x-matroska" />
+                <data android:mimeType="application/x-mpegurl" />
+                <data android:mimeType="application/x-ogg" />
+                <data android:mimeType="application/x-quicktimeplayer" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="rtmp" />
+                <data android:scheme="rtmps" />
+                <data android:scheme="rtp" />
+                <data android:scheme="rtsp" />
+                <data android:scheme="mms" />
+                <data android:scheme="mmst" />
+                <data android:scheme="mmsh" />
+                <data android:scheme="tcp" />
+                <data android:scheme="udp" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:host="*"
+                    tools:ignore="AppLinkUrlError" />
+
+                <!-- basically copied from mpv-android -->
+                <!-- the duplicate patterns below work around an Android bug: -->
+                <!-- http://stackoverflow.com/questions/3400072/#answer-8599921 -->
+                <data android:pathPattern=".*\\.mkv" />
+                <data android:pathPattern=".*\\..*\\.mkv" />
+                <data android:pathPattern=".*\\..*\\..*\\.mkv" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mkv" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.mkv" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.mkv" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.mkv" />
+
+                <data android:pathPattern=".*\\.mp4" />
+                <data android:pathPattern=".*\\..*\\.mp4" />
+                <data android:pathPattern=".*\\..*\\..*\\.mp4" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mp4" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.mp4" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.mp4" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.mp4" />
+
+                <data android:pathPattern=".*\\.webm" />
+                <data android:pathPattern=".*\\..*\\.webm" />
+                <data android:pathPattern=".*\\..*\\..*\\.webm" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.webm" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.webm" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.webm" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.webm" />
+
+                <data android:pathPattern=".*\\.avi" />
+                <data android:pathPattern=".*\\..*\\.avi" />
+                <data android:pathPattern=".*\\..*\\..*\\.avi" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.avi" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.avi" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.avi" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.avi" />
+
+                <data android:pathPattern=".*\\.mov" />
+                <data android:pathPattern=".*\\..*\\.mov" />
+                <data android:pathPattern=".*\\..*\\..*\\.mov" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mov" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.mov" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.mov" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.mov" />
+
+                <data android:pathPattern=".*\\.m4v" />
+                <data android:pathPattern=".*\\..*\\.m4v" />
+                <data android:pathPattern=".*\\..*\\..*\\.m4v" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.m4v" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.m4v" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.m4v" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.m4v" />
+
+                <data android:pathPattern=".*\\.flac" />
+                <data android:pathPattern=".*\\..*\\.flac" />
+                <data android:pathPattern=".*\\..*\\..*\\.flac" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.flac" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.flac" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.flac" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.flac" />
+
+                <data android:pathPattern=".*\\.mp3" />
+                <data android:pathPattern=".*\\..*\\.mp3" />
+                <data android:pathPattern=".*\\..*\\..*\\.mp3" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.mp3" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.mp3" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.mp3" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.mp3" />
+
+                <data android:pathPattern=".*\\.ogg" />
+                <data android:pathPattern=".*\\..*\\.ogg" />
+                <data android:pathPattern=".*\\..*\\..*\\.ogg" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.ogg" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.ogg" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.ogg" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.ogg" />
+
+                <data android:pathPattern=".*\\.m3u8*" />
+                <data android:pathPattern=".*\\..*\\.m3u8*" />
+                <data android:pathPattern=".*\\..*\\..*\\.m3u8*" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.m3u8*" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\.m3u8*" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\.m3u8*" />
+                <data android:pathPattern=".*\\..*\\..*\\..*\\..*\\..*\\..*\\.m3u8*" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          GSY 备用内核播放页。
+          它是一套**完全独立的播放页**：自己一个 Activity + 自己一套 XML 布局
+          （res/layout/activity_gsy_player.xml → gsy_player_cineisle.xml），
+          外观按 CineIsle 播放器重画（透明玻璃控件），但状态机 / 手势 / 全屏全部走 GSY 官方实现。
+          单独一个 Activity 而不是在 PlayerActivity 里加分支，是为了把「备用内核出问题」的影响面
+          关在这个页面里 —— mpv 那条路完全不受牵连；配置也各自独立（见 GsyPreferences / GsyPreferencesScreen）。
+        -->
+        <activity
+            android:name=".ui.player.GsyPlayerActivity"
+            android:autoRemoveFromRecents="true"
+            android:noHistory="false"
+            android:excludeFromRecents="false"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:documentLaunchMode="never"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:theme="@style/Theme.mpvex" />
+
+        <!--
+          「视界流」：仿抖音竖屏上下滑连播的播放器。
+
+          单独一个 Activity：configChanges 里自己接管旋转，横竖屏切换不会重建
+          —— 重建会把 MPVLib 的解码实例跟着一起销毁重建，画面要黑一整轮。
+        -->
+        <activity
+            android:name=".ui.player.feed.VerticalFeedActivity"
+            android:autoRemoveFromRecents="true"
+            android:noHistory="false"
+            android:excludeFromRecents="false"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:documentLaunchMode="never"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.mpvex.Feed" />
+
+        <activity android:name=".presentation.crash.CrashActivity" />
+
+        <activity
+            android:name=".ui.mediainfo.MediaInfoActivity"
+            android:exported="true"
+            android:theme="@style/Theme.mpvex"
+            android:label="Media Info">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/x-subrip" />
+                <data android:mimeType="application/x-subtitle" />
+                <data android:mimeType="application/x-subtitle-srt" />
+                <data android:mimeType="application/x-subtitle-ssa" />
+                <data android:mimeType="application/x-subtitle-ass" />
+                <data android:mimeType="application/x-subtitle-vtt" />
+                <data android:mimeType="application/ogg" />
+                <data android:mimeType="application/x-matroska" />
+                <data android:mimeType="application/x-flac" />
+                <data android:mimeType="application/mp4" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/x-subrip" />
+                <data android:mimeType="application/x-subtitle" />
+                <data android:mimeType="application/x-matroska" />
+                <data android:mimeType="application/x-flac" />
+                <data android:mimeType="application/mp4" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/x-mpegurl" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:pathPattern=".*\\.mkv" />
+                <data android:pathPattern=".*\\.mp4" />
+                <data android:pathPattern=".*\\.webm" />
+                <data android:pathPattern=".*\\.avi" />
+                <data android:pathPattern=".*\\.mov" />
+                <data android:pathPattern=".*\\.m4v" />
+                <data android:pathPattern=".*\\.flac" />
+                <data android:pathPattern=".*\\.mp3" />
+                <data android:pathPattern=".*\\.ogg" />
+                <data android:pathPattern=".*\\.m3u8.*" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".ui.player.MediaPlaybackService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name="androidx.media.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Media scan receiver to detect when new videos are added -->
+        <receiver
+            android:name=".utils.media.MediaScanReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_SCANNER_FINISHED" />
+                <action android:name="android.intent.action.MEDIA_SCANNER_SCAN_FILE" />
+                <data android:scheme="file" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 桌面小组件：「继续观看」（3 条最近没看完的内容） -->
+        <receiver
+            android:name=".widget.EmbyContinueWatchingWidget"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/emby_continue_widget_info" />
+        </receiver>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths" />
+        </provider>
+
+        <provider
+            android:name=".ui.browser.networkstreaming.NetworkStreamingProvider"
+            android:authorities="${applicationId}.networkstreaming"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>
