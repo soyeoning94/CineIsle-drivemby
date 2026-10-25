@@ -60,9 +60,9 @@ jobs:
           set -eux
           chmod +x ./gradlew
           if [ -f keystore.properties ]; then
-            ./gradlew assembleFdroidRelease --no-daemon --stacktrace
+            ./gradlew assembleFdroidRelease --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m"
           else
-            ./gradlew assembleFdroidDebug --no-daemon --stacktrace
+            ./gradlew assembleFdroidDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m"
           fi
 
       - name: Collect APKs
