@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main, drivemby ]
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -79,3 +82,16 @@ jobs:
           path: out/*.apk
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Publish release (APK 可直接下载)
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: "CineIsle Drivemby APK #${{ github.run_number }}"
+          body: |
+            自编译版本：Drivemby 网盘网关支持（PlaybackInfo Path + RequiredHttpHeaders）。
+            直接下载下方 APK 安装即可。
+          files: out/*.apk
+          draft: false
+          prerelease: true
