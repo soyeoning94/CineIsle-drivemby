@@ -212,6 +212,9 @@ class GsyPlayerActivity : ComponentActivity() {
 
   /** 这条视频已经降过一次级了 —— 防止「失败 → 降级 → 又失败」反复重建 */
   private var kernelFallbackUsed = false
+
+  /** Drivemby 百度 HTTPS 直链必须固定 Exo，禁止失败后退回会触发 fdsan 的 IJK/mpv native 路径 */
+  private var kernelFallbackLocked = false
   private var playlistId: Int? = null
   private var embyServerId: Long? = null
   private var embyItemIds: List<String> = emptyList()
@@ -431,6 +434,7 @@ class GsyPlayerActivity : ComponentActivity() {
       source.getStringExtra(EXTRA_FORCE_KERNEL)?.let { name ->
         GsyKernelKind.entries.firstOrNull { it.name == name }
       }
+    kernelFallbackLocked = source.getBooleanExtra(EXTRA_LOCK_KERNEL, false)
 
     currentUri =
       playlist.getOrNull(currentIndex)
@@ -625,6 +629,10 @@ class GsyPlayerActivity : ComponentActivity() {
    * 「现在放到第几个」全丢，Emby 那边的进度回传也断档 —— 所以整份 [PlayerHandoff] 都要带上。
    */
   private fun switchToMpvPlayer() {
+    if (kernelFallbackLocked) {
+      Toast.makeText(this, "百度网盘 HTTPS 直链不能切换到 native 内核，请返回后选择其他片源", Toast.LENGTH_LONG).show()
+      return
+    }
     val uri = currentUri
     if (uri == null) {
       Toast.makeText(this, R.string.player_engine_switch_unavailable, Toast.LENGTH_SHORT).show()
@@ -994,6 +1002,10 @@ class GsyPlayerActivity : ComponentActivity() {
    * 只降一次：降完还失败就直接把话说清楚，不要无限重建把用户卡在闪屏里。
    */
   private fun fallbackToIjk() {
+    if (kernelFallbackLocked) {
+      Toast.makeText(this, "该网盘直链已固定使用 Exo 内核，避免切回 native 内核导致崩溃", Toast.LENGTH_LONG).show()
+      return
+    }
     val current = forcedKernel ?: prefs.kernel.get()
     if (current == GsyKernelKind.IJK) {
       Toast.makeText(this, "所有可用内核均无法解码该文件，请检查媒体源是否完好", Toast.LENGTH_LONG).show()
@@ -1034,6 +1046,7 @@ class GsyPlayerActivity : ComponentActivity() {
       // 降级出来的「强制内核」必须跟着重建一起带过去。否则重建后 `readSession` 读不到它，
       // 又会用回用户选的那个内核 → 再失败 → 再降级，就成了死循环。
       forcedKernel?.let { putExtra(EXTRA_FORCE_KERNEL, it.name) }
+      putExtra(EXTRA_LOCK_KERNEL, kernelFallbackLocked)
       setIntent(this)
     }
     recreate()
@@ -2472,8 +2485,11 @@ class GsyPlayerActivity : ComponentActivity() {
     /** 重建播放页时强制按 position 续播（不受「续播到上次位置」开关影响） */
     private const val EXTRA_RESTORE_POSITION = "gsy_restore_position"
 
+    /** 本次播放固定指定内核，禁止解码失败后自动切回 IJK */
+    internal const val EXTRA_LOCK_KERNEL = "gsy_lock_kernel"
+
     /** 解码失败降级时，重建播放页要带上「本次强制用哪个内核」（值 = [GsyKernelKind].name） */
-    private const val EXTRA_FORCE_KERNEL = "gsy_force_kernel"
+    internal const val EXTRA_FORCE_KERNEL = "gsy_force_kernel"
 
     /** 字幕延迟一次调整的步长 */
     private const val SUBTITLE_STEP_MS = 500L

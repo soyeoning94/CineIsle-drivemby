@@ -2726,7 +2726,9 @@ object EmbyClient {
   ): PlaybackSourceInfo? {
     val key = itemId + "|" + (mediaSourceId ?: "")
     playbackSourceCache[key]?.let { return it }
-    val got = runCatching {
+    val got =
+      try {
+        run {
       val payload =
         jsonObjectOf(
           mapOf(
@@ -2751,17 +2753,22 @@ object EmbyClient {
         )
       val src =
         info.MediaSources?.firstOrNull { mediaSourceId == null || it.Id == mediaSourceId }
-          ?: return@runCatching null
+          ?: return@run null
       // DirectStreamUrl 和 Path 语义相同，谁有就用谁；SMB 的 smb:// 不要
       val raw =
         src.DirectStreamUrl?.takeIf { it.startsWith("http") }
           ?: src.Path?.takeIf { it.startsWith("http") }
-          ?: return@runCatching null
+          ?: return@run null
       PlaybackSourceInfo(
         url = ensureApiKey(absolutize(server, raw), server),
         headers = src.RequiredHttpHeaders.orEmpty(),
       )
-    }.getOrNull()
+        }
+      } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+      } catch (_: Exception) {
+        null
+      }
     if (got != null) playbackSourceCache[key] = got
     return got
   }
@@ -2821,12 +2828,30 @@ object EmbyClient {
     return "${server.hostUrl}/emby/Videos/$itemId/stream?$qs"
   }
 
-  /** 服务器给的 `DirectStreamUrl` 未必带 `api_key`（取决于 `AddApiKeyToDirectStreamUrl`），补上更稳。 */
+  /** 仅给同源的 Emby 地址补 api_key；第三方直链绝不能携带服务器令牌。 */
   private fun ensureApiKey(url: String, server: EmbyServer): String {
     if (server.apiToken.isEmpty()) return url
     if (url.contains("api_key=")) return url
+    if (!sameOrigin(url, server.hostUrl)) return url
     return url + (if (url.contains("?")) "&" else "?") + "api_key=${server.apiToken}"
   }
+
+  internal fun sameOrigin(url: String, serverUrl: String): Boolean =
+    runCatching {
+      val target = java.net.URI(url)
+      val server = java.net.URI(serverUrl)
+      target.scheme.equals(server.scheme, ignoreCase = true) &&
+        target.host.equals(server.host, ignoreCase = true) &&
+        effectivePort(target) == effectivePort(server)
+    }.getOrDefault(false)
+
+  private fun effectivePort(uri: java.net.URI): Int =
+    when {
+      uri.port >= 0 -> uri.port
+      uri.scheme.equals("https", ignoreCase = true) -> 443
+      uri.scheme.equals("http", ignoreCase = true) -> 80
+      else -> -1
+    }
 
   /**
    * 「让**服务器转码**」后的播放地址 —— 本机解不了的文件走这条路。

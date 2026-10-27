@@ -298,7 +298,9 @@ object EmbyDiscoverScreen : Screen {
                     val current = server ?: return@TextButton
                     // playFromStartAll = true：即混列表常混着看过的剧，
                     // 切到下一部时恢复续播会直接跳到片尾就结束
-                    embyVm.launchPlaylist(current, mix, playFromStartAll = true)
+                    scope.launch {
+                      embyVm.launchPlaylist(current, mix, playFromStartAll = true)
+                    }
                   },
                 ) {
                   Icon(Icons.Default.PlayArrow, contentDescription = null, Modifier.size(18.dp))

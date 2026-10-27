@@ -1535,27 +1535,49 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
     // 必须用 MediaSources[i].Path/DirectStreamUrl；普通 Emby 返回 null，走原路径。
     val directSource =
       if (overrideUrl == null) {
-        runCatching { EmbyClient.playbackSourceFor(server, itemId, mediaSourceId) }
-          .onFailure {
-            app.marlboroadvance.mpvex.ui.player.PlayerDiagLog.log(
-              "emby-play",
-              "playbackSourceFor 失败: " + it.javaClass.simpleName + ": " + (it.message ?: ""),
-            )
+        try {
+          withContext(Dispatchers.IO) {
+            EmbyClient.playbackSourceFor(server, itemId, mediaSourceId)
           }
-          .getOrNull()
+        } catch (cancelled: CancellationException) {
+          throw cancelled
+        } catch (error: Exception) {
+          app.marlboroadvance.mpvex.ui.player.PlayerDiagLog.log(
+            "emby-play",
+            "playbackSourceFor 失败: " + error.javaClass.simpleName + ": " + (error.message ?: ""),
+          )
+          null
+        }
       } else {
         null
       }
     val url = overrideUrl
       ?: directSource?.url
       ?: repository.videoStreamUrl(server, itemId, static = true, mediaSourceId = mediaSourceId)
-    // 【诊断】记录真正交给播放器的地址与请求头 —— 排查网盘直连失败时唯一可靠的一手数据
+    val playbackRoute =
+      EmbyDirectPlaybackRoute.choose(
+        url = url,
+        requiredHeaders = directSource?.headers ?: emptyMap(),
+        requestedEngine = engine,
+      )
+    // 【诊断】只记录地址来源、主机/路径和请求头名称；令牌、Cookie 等值不得落盘。
+    val diagnosticUrl =
+      runCatching {
+        java.net.URI(url).let { uri ->
+          buildString {
+            append(uri.scheme ?: "")
+            append("://")
+            append(uri.host ?: "")
+            append(uri.path ?: "")
+          }
+        }
+      }.getOrDefault("unparseable")
     app.marlboroadvance.mpvex.ui.player.PlayerDiagLog.log(
       "emby-play",
       "item=" + itemId +
         " direct=" + (directSource != null) +
-        " url=" + url.take(200) +
-        " headers=" + (directSource?.headers ?: emptyMap<String, String>()).toString(),
+        " url=" + diagnosticUrl.take(200) +
+        " headerNames=" + (directSource?.headers ?: emptyMap<String, String>()).keys.sorted(),
     )
     val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).apply {
       setClass(getApplication(), PlayerActivity::class.java)
@@ -1585,13 +1607,20 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
       // 「记忆播放设置」的键：剧集用所属剧的 Id（整季共用一份速度 / 音轨），
       // 电影没有 SeriesId，就用它自己的 Id。
       putExtra("emby_series_key", item.SeriesId ?: itemId)
-      putEngine(engine)
+      putEngine(playbackRoute.engine)
+      playbackRoute.forcedGsyKernel?.let {
+        putExtra(GsyPlayerActivity.EXTRA_FORCE_KERNEL, it.name)
+        putExtra(GsyPlayerActivity.EXTRA_LOCK_KERNEL, playbackRoute.lockGsyKernel)
+      }
       // 这条是「预解析」探出来的直链：探测与真正拉流必须用同一套请求头。
       // 网盘直链（115 这类）常把 UA / Referer 算进签名校验，两边不一致就会被 403
       // —— 现象正是「解析成功、播放必失败」。播放器侧的 headers 约定：
       // 第 0/1 位是 User-Agent，其后两两成对（见 PlayerActivity.setHttpHeadersFromExtras）。
       // Referer 统一给**服务器**的来源，而不是直链自己（自引用常被网盘判为非法）。
-      if (overrideUrl != null && !isLocalIsoProxyUrl(overrideUrl)) {
+      if (playbackRoute.forcedGsyKernel != null) {
+        // 百度 PCS：只带 pan.baidu.com UA，绝不带 Referer；同时由 Exo 处理 HTTPS。
+        putStreamHeaders(server, playbackRoute.streamHeaders)
+      } else if (overrideUrl != null && !isLocalIsoProxyUrl(overrideUrl)) {
         putStreamHeaders(server)
       } else if (directSource != null) {
         // 服务端要求的 UA 等请求头必须原样带上，否则网盘直链 403
@@ -1656,7 +1685,7 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
     else null
 
   /** 播放一组媒体（剧集连播 / 随机播放） */
-  fun launchPlaylist(
+  suspend fun launchPlaylist(
     server: EmbyServer,
     items: List<EmbyItem>,
     resumeSeconds: Long = 0,
@@ -1683,6 +1712,68 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
     /** [firstMediaSourceId] 对应的显示名；播放页顶栏据此显示「正在播的是哪个版本」。 */
     firstMediaSourceName: String? = null,
   ) {
+    launchPlaylistResolved(
+      server = server,
+      items = items,
+      resumeSeconds = resumeSeconds,
+      playFromStartAll = playFromStartAll,
+      engine = engine,
+      directUrls = directUrls,
+      firstMediaSourceId = firstMediaSourceId,
+      firstMediaSourceName = firstMediaSourceName,
+    )
+  }
+
+  private suspend fun launchPlaylistResolved(
+    server: EmbyServer,
+    items: List<EmbyItem>,
+    resumeSeconds: Long,
+    playFromStartAll: Boolean,
+    engine: EngineKind?,
+    directUrls: Map<String, String>,
+    firstMediaSourceId: String?,
+    firstMediaSourceName: String?,
+  ) {
+    val firstItem = items.firstOrNull() ?: return
+    val firstItemId = firstItem.Id ?: return
+    val firstSourceId = firstMediaSourceId ?: firstItem.MediaSources?.firstOrNull()?.Id
+    val firstPlaybackSource =
+      try {
+        withContext(Dispatchers.IO) {
+          EmbyClient.playbackSourceFor(server, firstItemId, firstSourceId)
+        }
+      } catch (cancelled: CancellationException) {
+        throw cancelled
+      } catch (_: Exception) {
+        null
+      }
+    val firstUrl =
+      directUrls[firstItemId]
+        ?: firstPlaybackSource?.url
+        ?: repository.videoStreamUrl(server, firstItemId, static = true, mediaSourceId = firstSourceId)
+    val playbackRoute =
+      EmbyDirectPlaybackRoute.choose(
+        url = firstUrl,
+        requiredHeaders = firstPlaybackSource?.headers ?: emptyMap(),
+        requestedEngine = engine,
+      )
+    if (playbackRoute.forcedGsyKernel != null) {
+      // 当前播放器的列表协议只有一组全局请求头，无法安全地把百度与其它来源混播：
+      // 会把 Cookie/UA 重放到错误主机。百度直链因此只启动当前条目，确保不回落 native。
+      android.widget.Toast
+        .makeText(getApplication(), "百度直链暂不支持自动连播，已播放当前条目", android.widget.Toast.LENGTH_LONG)
+        .show()
+      launchSingle(
+        server = server,
+        item = firstItem,
+        resumeSeconds = resumeSeconds,
+        engine = engine,
+        mediaSourceId = firstMediaSourceId,
+        mediaSourceLabel = firstMediaSourceName,
+      )
+      return
+    }
+    val routedDirectUrls = LinkedHashMap(directUrls)
     val uris = ArrayList<android.net.Uri>()
     val ids = ArrayList<String>()
     // 与 uris 下标一一对应的显示标题。播放器侧切集时用它，避免从
@@ -1714,7 +1805,7 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
       }
       uris.add(
         android.net.Uri.parse(
-          directUrls[id]
+          routedDirectUrls[id]
             ?: repository.videoStreamUrl(server, id, static = true, mediaSourceId = sourceId),
         ),
       )
@@ -1762,8 +1853,10 @@ private fun isLocalIsoProxyUrl(url: String): Boolean =
       // 播放列表的 ID 顺序与 uris 一致，切集时据此把"正在播放"同步给服务器
       putEmbyPlaybackExtras(server, ids, mediaSourceIds, mediaSourceNames, episodeNumbers)
       putEngine(engine)
-      // 列表里只要有用预解析直链换掉的条目，就得同步请求头（理由见 [putStreamHeaders]）
-      if (directUrls.isNotEmpty()) putStreamHeaders(server)
+      if (routedDirectUrls.isNotEmpty()) {
+        // 列表里只要有用预解析直链换掉的条目，就得同步请求头（理由见 [putStreamHeaders]）
+        putStreamHeaders(server)
+      }
       addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     getApplication<Application>().startActivity(intent)

@@ -204,7 +204,7 @@ data class EmbyPersonScreen(
         Toast.makeText(context, "当前筛选下没有可播放的作品", Toast.LENGTH_SHORT).show()
         return
       }
-      viewModel.launchPlaylist(current, pool, playFromStartAll = true)
+      scope.launch { viewModel.launchPlaylist(current, pool, playFromStartAll = true) }
     }
 
     suspend fun load() {
